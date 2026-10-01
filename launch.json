@@ -1,0 +1,21 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "BuyOnlyVoteHook",
+    "constructorArgs": ["$poolManager"],
+    "permissions": ["beforeInitialize", "beforeSwap", "afterSwap"]
+  },
+  "token": {
+    "contract": "SurfToken",
+    "name": "Surf",
+    "symbol": "SURF",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 0,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "Native ETH/SURF pool: currency0 is native ETH and currency1 is SurfToken. The initial sqrtPriceX96 is 2^96, a 1:1 token-unit ratio (1 SURF per ETH with 18 decimals); tickSpacing 60 and this price follow the repository test fixtures. The pool fee is set to 0 to implement the no-fees brief. BuyOnlyVoteHook charges no hook fee, overrides no LP fee and returns zero swap deltas. No fees are routed to surfsurf.eth, and the hook has no fee recipient parameter or stored recipient address. The sole constructor argument is the launch chain's PoolManager, resolved from $poolManager. The token constructor takes no arguments. beforeInitialize accepts only the PoolManager, binds the hook to the first initialized pool with native ETH as currency0, records its token and initialization timestamp, and fixes quorum at 1% of that token's totalSupply. The declared callbacks all restrict callers to the PoolManager; their address permission bits are 0x20c0 (8384), with all return-delta permissions disabled. Days are 24-hour periods counted from pool initialization, not UTC calendar days. Buys (ETH in, SURF out) are always permitted by the hook. During the first 23 hours of each day, accounts may vote once with their entire staked SURF balance; voting locks withdrawals until the next day. The last hour permits sells only if yes votes strictly exceed no votes AND total votes meet quorum. The aggregate sell allowance is floor(previous day's bought SURF / 2), measured in token units, shared first come first served; day zero has no allowance and unused allowance does not carry forward. beforeSwap gates sells and checks requested exact-input sells against the remaining allowance. afterSwap records actual SURF bought or sold and enforces the allowance on all sells, including exact-output swaps. There is no administrator, upgrade mechanism or setter for these rules. Scope limitation: restrictions apply to swaps through this hook. Token transfers and other pools are unrestricted. Liquidity additions and removals are also ungated, so liquidity providers can make economic exits outside the sell window and cap."
+}
