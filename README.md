@@ -31,6 +31,19 @@ starts at `genesis + d * 24h`. Within every day:
   `beforeSwap` (`SellCapExceeded(requested, remaining)`); every sell, including exact-output ones, is
   re-checked in `afterSwap` against the SURF actually paid, so the pool's own computation cannot
   exceed it.
+- **The cap counts net sells.** A buy made while the window is open first cancels SURF already counted
+  as sold today (`sold[day]` goes down by the amount bought, floored at zero) and only the remainder
+  counts as a buy for tomorrow's cap. So a seller who buys back frees the cap for everybody else, and
+  a sell-and-rebuy round trip neither holds the cap hostage nor inflates tomorrow's cap. Before the
+  window opens `sold[day]` is always zero, so buys outside the window count in full.
+- **Liquidity removals that turn SURF into ETH are sells.** Adding liquidity is always allowed. The
+  hook records, per position, the liquidity and the SURF principal deposited. When liquidity is
+  removed, the SURF returned is compared with the proportional share of what was deposited; a
+  shortfall (SURF that buys converted into ETH inside the position) is treated exactly like a swap
+  sell: it must happen in an open window and is charged against the day's cap (`SellsClosed` /
+  `SellCapExceeded` from `afterRemoveLiquidity`, event `LiquiditySold`). A position that returns at
+  least what it deposited, give or take the pool's rounding (`LP_ROUNDING_TOLERANCE`, 10^6 wei =
+  10^-12 SURF), can be removed at any time. Fee collection (`liquidityDelta == 0`) is never charged.
 - **Each day needs its own vote.** Tallies and caps are per day; nothing carries over.
 
 ### Voting weight: staked SURF
@@ -51,13 +64,15 @@ Staked SURF is held by the hook and can only ever be withdrawn by the account th
 
 | Callback | Enabled | What it does |
 | --- | --- | --- |
-| `beforeInitialize` | yes | Binds the hook to its single pool, records `genesis` and `quorum`. Refuses a second pool (`AlreadyInitialized`) and any pool whose `currency0` is not native ETH (`Currency0MustBeNative`). |
+| `beforeInitialize` | yes | Binds the hook to its single pool, records `genesis` and `quorum`. Refuses a second pool (`AlreadyInitialized`), any pool whose `currency0` is not native ETH (`Currency0MustBeNative`) and any pool whose LP fee is not zero (`FeeMustBeZero`). |
+| `afterAddLiquidity` | yes | Records the position's liquidity and the SURF principal it deposited. Never refuses. Returns a zero delta. |
+| `afterRemoveLiquidity` | yes | Compares the SURF returned with the position's proportional deposit; charges a shortfall as a sell (window and cap). Returns a zero delta. |
 | `beforeSwap` | yes | Rejects sells outside an open window; rejects exact-input sells over the remaining cap. Returns a zero delta and no fee override. |
-| `afterSwap` | yes | Records buys; records sells and enforces the cap on the SURF actually paid. |
+| `afterSwap` | yes | Records buys (netting them against today's sells first); records sells and enforces the cap on the SURF actually paid. |
 | everything else | no | Not declared in the address bits; the implementations revert with `HookNotImplemented` and the pool manager never calls them. |
 
-All three callbacks accept calls only from the pool manager (`NotPoolManager` otherwise). The hook
-returns no deltas, charges no fee and moves no funds inside a swap.
+All five callbacks accept calls only from the pool manager (`NotPoolManager` otherwise). The hook
+returns zero deltas, charges no fee and moves no funds inside a swap or a liquidity change.
 
 ### Hook configuration record (the Wizard's canonical shape)
 
@@ -75,8 +90,8 @@ returns no deltas, charges no fee and moves no funds inside a swap.
     "afterInitialize": false,
     "beforeAddLiquidity": false,
     "beforeRemoveLiquidity": false,
-    "afterAddLiquidity": false,
-    "afterRemoveLiquidity": false,
+    "afterAddLiquidity": true,
+    "afterRemoveLiquidity": true,
     "beforeSwap": true,
     "afterSwap": true,
     "beforeDonate": false,
@@ -94,15 +109,18 @@ returns no deltas, charges no fee and moves no funds inside a swap.
 
 The vendored v4-periphery carries no `BaseHook`, so the hook implements `IHooks` directly on v4-core
 and validates its own address bits in the constructor with `Hooks.validateHookPermissions`. The
-address must carry exactly `BEFORE_INITIALIZE | BEFORE_SWAP | AFTER_SWAP` = `0x20C0` (decimal 8384);
-`src/HookMiner.sol` finds a CREATE2 salt for that.
+address must carry exactly
+`BEFORE_INITIALIZE | AFTER_ADD_LIQUIDITY | AFTER_REMOVE_LIQUIDITY | BEFORE_SWAP | AFTER_SWAP` =
+`0x25C0` (decimal 9664); `src/HookMiner.sol` finds a CREATE2 salt for that.
 
 ## Fees
 
 The brief says "no fees" and names `surfsurf.eth` as the fee recipient. The hook charges nothing:
 no swap fee, no hook fee, no return deltas, so there is nothing to send to `surfsurf.eth` and the
-hook holds no address for it. The pool's own LP fee (`PoolKey.fee`) is a launch parameter chosen by
-the deployer and goes to liquidity providers as in any v4 pool; the hook does not override it.
+hook holds no address for it. The pool's own LP fee (`PoolKey.fee`) must be zero as well: a static
+fee is fixed in the pool key at initialization and the hook overrides nothing, so `beforeInitialize`
+refuses any key whose `fee` is not `0` (`FeeMustBeZero`), including the dynamic-fee flag. Every test
+in this repository and the deploy script use `fee = 0`; liquidity providers earn no fees.
 
 ## The token
 
@@ -114,24 +132,39 @@ restrict transfers: "buys only" is a rule of the hooked pool, not of the token.
 
 ## Assumptions and known limitations
 
-- **Pair.** The pool is native ETH / SURF, with ETH as `currency0`. The hook refuses any other pool
-  at initialization; a WETH or stablecoin pair would need a different hook.
+- **Pair.** The pool is native ETH / SURF, with ETH as `currency0` and a zero LP fee. The hook refuses
+  any other pool at initialization; a WETH or stablecoin pair would need a different hook.
 - **Clock.** Days use `block.timestamp`. Validators can skew a block by seconds, not hours, so a
   boundary can only move by that much.
 - **Quorum and shares are constants.** 1% of supply for quorum, 50% of yesterday's buys for the cap,
   23 h voting + 1 h window. Nobody can change them; a different setting is a new deployment.
 - **Vote weight is staked SURF, not held SURF.** Holders who do not stake do not vote. This is the
-  only Sybil-resistant choice with a plain ERC-20 and no snapshot machinery.
-- **Liquidity operations are not gated.** Adding or removing liquidity is allowed at any time. A
-  liquidity provider who places SURF-only liquidity below the price and later withdraws the ETH that
-  buys deposited there has, economically, sold SURF outside the window and the cap. The launch
-  factory seeds the pool, and gating liquidity against an unknown factory flow risked breaking the
-  launch itself, so this is documented rather than blocked. If the operator wants it blocked, a
-  `beforeAddLiquidity` rule restricted to the launch transaction is the natural follow-up.
+  only Sybil-resistant choice with a plain ERC-20 and no snapshot machinery. Whoever holds the
+  undistributed supply (the launch treasury, unlocked allocations) can decide every vote by staking
+  it, and if nobody stakes 10,000,000 SURF on a day the window never opens. Both are the rule as
+  briefed, not something the contracts control.
+- **Liquidity providers are bound by the same rule as swappers.** This includes the launch seed:
+  once buys have converted part of a position's SURF into ETH, that ETH can only be withdrawn in an
+  open window and within the cap, like any other sell. An LP who adds SURF-only liquidity below the
+  price and wants the ETH out must wait for a window with enough cap left; the position can always
+  be removed once the price has come back so that it returns its SURF. Positions are tracked under
+  the pool manager's own key (`owner, tickLower, tickUpper, salt`, where the owner is the router or
+  position manager that called `modifyLiquidity`), so transferring a position NFT does not reset the
+  accounting. Proportional attribution on partial removals and the rounding tolerance are the
+  approximations involved; the tolerance is 10^-12 SURF per removal.
+- **Residual window griefing.** A holder can still sell the whole cap at 23:00 and buy it back at
+  23:59, locking others out for most of the hour. Unlike before, the cap is restored when they buy
+  back, the round trip does not count as a buy, and they carry the price exposure of every buy that
+  happens meanwhile; a per-seller allocation is not possible because the hook only ever sees the
+  router, not the end user.
 - **The cap counts tokens, not value.** Half of yesterday's bought SURF may be sold regardless of
   price moves since.
 - **Anyone can buy to raise tomorrow's cap**, including a seller planning ahead; that is the rule as
-  briefed.
+  briefed. Buying through one's own liquidity counts like any other buy, but the ETH that lands in
+  the position can only leave as a sell, so the cap it created is consumed by recovering it.
+- **The rule binds the hooked pool only.** SURF transfers freely, so a second, hookless ETH/SURF pool
+  or any other venue can trade it without these rules. The rule bites as long as the hooked pool
+  holds the liquidity that matters; the launch token's rules forbid a transfer restriction.
 - **No hook fee means no ETH ever sits in the hook**, so none of the "fee transfer fails on a fresh
   manager" failure modes apply. A buy on a freshly deployed manager seeded with SURF only is tested.
 
@@ -146,16 +179,19 @@ restrict transfers: "buys only" is a rule of the hooked pool, not of the token.
 | `currentDay()`, `secondsIntoDay()` | Position in the day schedule (revert before initialization). |
 | `votingOpen()`, `sellWindowOpen()` | Whether voting or selling is possible right now. |
 | `votePassed(day)`, `yesVotes(day)`, `noVotes(day)` | Vote state. |
-| `bought(day)`, `sold(day)`, `sellCap(day)`, `sellRemaining(day)` | Volume and cap state. |
+| `bought(day)`, `sold(day)`, `sellCap(day)`, `sellRemaining(day)` | Volume and cap state (`sold` is net of in-window rebuys). |
 | `staked(account)`, `lastVoteDay(account)` | Per-account state. |
+| `positions(key)`, `positionKey(owner, tickLower, tickUpper, salt)` | Liquidity accounting: mirrored liquidity and recorded SURF deposit per position. |
 | `token()`, `poolId()`, `genesis()`, `quorum()`, `poolManager()` | Binding. |
 | `getHookPermissions()` | The declared callbacks. |
+| `DAY`, `VOTING_PERIOD`, `SELL_WINDOW`, `SELL_SHARE_BPS`, `QUORUM_BPS`, `LP_ROUNDING_TOLERANCE` | Constants. |
 
-Events: `PoolBound`, `Bought`, `Sold`, `Staked`, `Unstaked`, `Voted`.
+Events: `PoolBound`, `Bought`, `Sold`, `LiquiditySold`, `Staked`, `Unstaked`, `Voted`.
 
 Errors: `NotPoolManager`, `HookNotImplemented`, `AlreadyInitialized`, `NotInitialized`,
-`Currency0MustBeNative`, `SellsClosed`, `SellCapExceeded(requested, remaining)`, `VotingClosed`,
-`AlreadyVoted`, `NothingStaked`, `StakeLockedByVote`, `ZeroAmount`, `InsufficientStake`.
+`Currency0MustBeNative`, `FeeMustBeZero`, `SellsClosed`, `SellCapExceeded(requested, remaining)`,
+`VotingClosed`, `AlreadyVoted`, `NothingStaked`, `StakeLockedByVote`, `ZeroAmount`,
+`InsufficientStake`.
 
 ABIs: `docs/abi/BuyOnlyVoteHook.json`, `docs/abi/SurfToken.json`.
 
@@ -184,25 +220,38 @@ This repository holds no keys and broadcasts nothing.
 | --- | --- |
 | Token constructor | none; supply minted to the deployer (the factory). |
 | Hook constructor | `(IPoolManager poolManager)`; in the manifest this is `"$poolManager"`, filled by the deployer with the chain's pool manager. Never hardcode it. |
-| Hook address bits | `0x20C0` (`beforeInitialize`, `beforeSwap`, `afterSwap`); mine the CREATE2 salt with `HookMiner.find(create2Deployer, 0x20C0, creationCode)`. |
-| Pool key | `currency0 = address(0)` (native ETH), `currency1 = SurfToken`, `hooks = BuyOnlyVoteHook`; `fee` and `tickSpacing` are the deployer's choice (tests use 3000 / 60). |
+| Hook address bits | `0x25C0` (`beforeInitialize`, `afterAddLiquidity`, `afterRemoveLiquidity`, `beforeSwap`, `afterSwap`); mine the CREATE2 salt with `HookMiner.find(create2Deployer, 0x25C0, creationCode)`. |
+| Pool key | `currency0 = address(0)` (native ETH), `currency1 = SurfToken`, `fee = 0` (the hook refuses anything else), `hooks = BuyOnlyVoteHook`; `tickSpacing` is the deployer's choice (tests and the script use 60). |
+| Initial price | the deployer's choice; the script defaults to `2^96` (1 SURF per ETH). |
 | Target chain | Sepolia (11155111) unless the job says otherwise; `script/Deploy.s.sol` accepts 31337 and 11155111 only. |
 
-`script/Deploy.s.sol:Deploy` is a rehearsal of those steps. `run()` reads `EXPECTED_CHAIN_ID`
-(0 or unset accepts the connected chain) and `POOL_MANAGER` (required on Sepolia, optional locally
-where a fresh pool manager is deployed), and hands them to `deploy(Config)`, which the tests call
-directly. The operator-only command, with the deployer's own key management outside this repository:
+`script/Deploy.s.sol:Deploy` is a rehearsal of those steps: it deploys the token, mines and deploys
+the hook through the public CREATE2 proxy, and **initializes the pool in the same broadcast**, so
+there is no gap in which a stray pool could bind the hook first (the hook binds to the first pool
+initialized through it). `run()` reads `EXPECTED_CHAIN_ID` (0 or unset accepts the connected chain),
+`POOL_MANAGER` (required on Sepolia, optional locally where a fresh pool manager is deployed),
+`SQRT_PRICE_X96` and `TICK_SPACING` (defaults above) and `SALT_START` (default 0), and hands them to
+`deploy(Config)`, which the tests call directly. The operator-only command, with the deployer's own
+key management outside this repository:
 
 ```sh
 EXPECTED_CHAIN_ID=11155111 POOL_MANAGER=<chain pool manager> \
   forge script script/Deploy.s.sol:Deploy --rpc-url <rpc> --broadcast
 ```
 
+Because the proxy is public and the salt search is deterministic, someone who sees the creation code
+could deploy the hook at the predicted address first and bind it to a stray pool. The script checks
+that the predicted address has no code and reverts with `HookAddressTaken` otherwise; the operator
+then reruns with a higher `SALT_START`. The deploy and initialize transactions are consecutive in the
+broadcast; if the initialize fails with `AlreadyInitialized`, the hook was front-run between the two
+and must be redeployed the same way.
+
 After deployment the operator should: verify both sources on the explorer
-(`forge verify-contract`), confirm the hook address ends in bits `0x20C0`, initialize the pool with
-ETH as `currency0`, and tell holders the schedule: voting from 0:00 to 23:00 of each pool day,
+(`forge verify-contract`), confirm the hook address ends in bits `0x25C0`, confirm the pool key on
+chain has `fee = 0`, and tell holders the schedule: voting from 0:00 to 23:00 of each pool day,
 selling from 23:00 to 24:00 if the vote passed, with the pool day starting at the initialization
-timestamp (`genesis()`). No ongoing operation is required: no keeper, no parameter updates, no
+timestamp (`genesis()`), and that liquidity withdrawals which return less SURF than deposited follow
+the same window and cap. No ongoing operation is required: no keeper, no parameter updates, no
 funds to collect.
 
 Tests passing are not a security audit. Review by an independent contributor is expected before

@@ -8,6 +8,7 @@ import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {CustomRevert} from "v4-core/src/libraries/CustomRevert.sol";
+import {LPFeeLibrary} from "v4-core/src/libraries/LPFeeLibrary.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
@@ -26,7 +27,8 @@ contract BuyOnlyVoteHookTest is Test {
     using PoolIdLibrary for PoolKey;
 
     uint160 constant SQRT_PRICE_1_1 = 79228162514264337593543950336;
-    uint160 constant FLAGS = HookFlags.BEFORE_INITIALIZE | HookFlags.BEFORE_SWAP | HookFlags.AFTER_SWAP;
+    uint160 constant FLAGS = HookFlags.BEFORE_INITIALIZE | HookFlags.AFTER_ADD_LIQUIDITY
+        | HookFlags.AFTER_REMOVE_LIQUIDITY | HookFlags.BEFORE_SWAP | HookFlags.AFTER_SWAP;
     uint256 constant START = 1_700_000_000;
 
     PoolManager manager;
@@ -55,7 +57,7 @@ contract BuyOnlyVoteHookTest is Test {
         key = PoolKey({
             currency0: Currency.wrap(address(0)),
             currency1: Currency.wrap(address(token)),
-            fee: 3_000,
+            fee: 0,
             tickSpacing: 60,
             hooks: IHooks(address(hook))
         });
@@ -73,6 +75,7 @@ contract BuyOnlyVoteHookTest is Test {
             vm.deal(users[i], 1_000 ether);
             vm.startPrank(users[i]);
             token.approve(address(swapRouter), type(uint256).max);
+            token.approve(address(lpRouter), type(uint256).max);
             token.approve(address(hook), type(uint256).max);
             vm.stopPrank();
         }
@@ -121,6 +124,58 @@ contract BuyOnlyVoteHookTest is Test {
         ethOut = uint256(int256(delta.amount0()));
     }
 
+    /// @dev Exact-output buy of `tokensOut` SURF, paying at most `maxEth`; the router refunds the rest.
+    function buyExactOut(address user, uint256 tokensOut, uint256 maxEth) internal returns (uint256 received) {
+        vm.prank(user);
+        BalanceDelta delta = swapRouter.swap{value: maxEth}(
+            key,
+            SwapParams({
+                zeroForOne: true, amountSpecified: int256(tokensOut), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        received = uint256(int256(delta.amount1()));
+    }
+
+    /// @dev Adds `liquidity` for `user` (salt 0) and returns the SURF it deposited.
+    function addLiquidity(address user, int24 lower, int24 upper, int256 liquidity, uint256 ethValue)
+        internal
+        returns (uint256 surfIn)
+    {
+        if (user != address(this)) {
+            vm.deal(user, user.balance + ethValue);
+            vm.prank(user);
+        }
+        BalanceDelta delta = lpRouter.modifyLiquidity{value: ethValue}(
+            key, ModifyLiquidityParams({tickLower: lower, tickUpper: upper, liquidityDelta: liquidity, salt: 0}), ""
+        );
+        surfIn = delta.amount1() < 0 ? uint256(int256(-delta.amount1())) : 0;
+    }
+
+    /// @dev Removes `liquidity` for `user` (salt 0) and returns the ETH and SURF it paid out.
+    function removeLiquidity(address user, int24 lower, int24 upper, int256 liquidity)
+        internal
+        returns (uint256 ethOut, uint256 surfOut)
+    {
+        if (user != address(this)) vm.prank(user);
+        BalanceDelta delta = lpRouter.modifyLiquidity(
+            key, ModifyLiquidityParams({tickLower: lower, tickUpper: upper, liquidityDelta: -liquidity, salt: 0}), ""
+        );
+        ethOut = delta.amount0() > 0 ? uint256(int256(delta.amount0())) : 0;
+        surfOut = delta.amount1() > 0 ? uint256(int256(delta.amount1())) : 0;
+    }
+
+    function expectRemoveRevert(address user, int24 lower, int24 upper, int256 liquidity, bytes memory reason)
+        internal
+    {
+        vm.expectRevert(reason);
+        vm.prank(user);
+        lpRouter.modifyLiquidity(
+            key, ModifyLiquidityParams({tickLower: lower, tickUpper: upper, liquidityDelta: -liquidity, salt: 0}), ""
+        );
+    }
+
     function expectSellRevert(address user, uint256 tokensIn, bytes memory reason) internal {
         vm.expectRevert(reason);
         vm.prank(user);
@@ -166,13 +221,13 @@ contract BuyOnlyVoteHookTest is Test {
         assertEq(HookFlags.flagsOf(address(hook)), FLAGS);
         Hooks.Permissions memory p = hook.getHookPermissions();
         assertTrue(p.beforeInitialize);
+        assertTrue(p.afterAddLiquidity);
+        assertTrue(p.afterRemoveLiquidity);
         assertTrue(p.beforeSwap);
         assertTrue(p.afterSwap);
         assertFalse(p.afterInitialize);
         assertFalse(p.beforeAddLiquidity);
-        assertFalse(p.afterAddLiquidity);
         assertFalse(p.beforeRemoveLiquidity);
-        assertFalse(p.afterRemoveLiquidity);
         assertFalse(p.beforeDonate);
         assertFalse(p.afterDonate);
         assertFalse(p.beforeSwapReturnDelta);
@@ -200,7 +255,6 @@ contract BuyOnlyVoteHookTest is Test {
 
     function test_initializeRefusesASecondPool() public {
         PoolKey memory other = key;
-        other.fee = 500;
         other.tickSpacing = 10;
         vm.expectRevert(
             hookRevert(
@@ -220,7 +274,7 @@ contract BuyOnlyVoteHookTest is Test {
         PoolKey memory erc20Key = PoolKey({
             currency0: Currency.wrap(lo),
             currency1: Currency.wrap(hi),
-            fee: 3_000,
+            fee: 0,
             tickSpacing: 60,
             hooks: IHooks(address(fresh))
         });
@@ -235,9 +289,59 @@ contract BuyOnlyVoteHookTest is Test {
         assertEq(fresh.genesis(), 0);
     }
 
+    function test_initializeRefusesAFeeBearingPool() public {
+        BuyOnlyVoteHook fresh = deployHook(manager);
+        PoolKey memory feeKey = key;
+        feeKey.hooks = IHooks(address(fresh));
+        feeKey.fee = 3_000;
+        vm.expectRevert(
+            hookRevert(
+                address(fresh),
+                IHooks.beforeInitialize.selector,
+                abi.encodeWithSelector(BuyOnlyVoteHook.FeeMustBeZero.selector)
+            )
+        );
+        manager.initialize(feeKey, SQRT_PRICE_1_1);
+
+        // A dynamic-fee key is refused too: the hook overrides no fee, so only a literal zero is "no fees".
+        feeKey.fee = LPFeeLibrary.DYNAMIC_FEE_FLAG;
+        vm.expectRevert(
+            hookRevert(
+                address(fresh),
+                IHooks.beforeInitialize.selector,
+                abi.encodeWithSelector(BuyOnlyVoteHook.FeeMustBeZero.selector)
+            )
+        );
+        manager.initialize(feeKey, SQRT_PRICE_1_1);
+        assertEq(fresh.genesis(), 0);
+
+        feeKey.fee = 0;
+        manager.initialize(feeKey, SQRT_PRICE_1_1);
+        assertEq(fresh.genesis(), block.timestamp);
+    }
+
+    function test_zeroFeePoolAccruesNoLpFees() public {
+        buy(alice, 10 ether);
+        // Collecting fees on the seed position (liquidityDelta 0) yields nothing.
+        BalanceDelta collected = lpRouter.modifyLiquidity(
+            key, ModifyLiquidityParams({tickLower: -887_220, tickUpper: 887_220, liquidityDelta: 0, salt: 0}), ""
+        );
+        assertEq(collected.amount0(), 0);
+        assertEq(collected.amount1(), 0);
+    }
+
     function test_callbacksRefuseCallersOtherThanThePoolManager() public {
+        ModifyLiquidityParams memory lp = ModifyLiquidityParams(-60, 60, 1 ether, 0);
+
         vm.expectRevert(BuyOnlyVoteHook.NotPoolManager.selector);
         hook.beforeInitialize(address(this), key, SQRT_PRICE_1_1);
+
+        vm.expectRevert(BuyOnlyVoteHook.NotPoolManager.selector);
+        hook.afterAddLiquidity(address(this), key, lp, BalanceDelta.wrap(0), BalanceDelta.wrap(0), "");
+
+        lp.liquidityDelta = -1 ether;
+        vm.expectRevert(BuyOnlyVoteHook.NotPoolManager.selector);
+        hook.afterRemoveLiquidity(address(this), key, lp, BalanceDelta.wrap(0), BalanceDelta.wrap(0), "");
 
         vm.expectRevert(BuyOnlyVoteHook.NotPoolManager.selector);
         hook.beforeSwap(address(this), key, sellParams(1 ether), "");
@@ -255,11 +359,7 @@ contract BuyOnlyVoteHookTest is Test {
         vm.expectRevert(err);
         hook.beforeAddLiquidity(address(this), key, lp, "");
         vm.expectRevert(err);
-        hook.afterAddLiquidity(address(this), key, lp, BalanceDelta.wrap(0), BalanceDelta.wrap(0), "");
-        vm.expectRevert(err);
         hook.beforeRemoveLiquidity(address(this), key, lp, "");
-        vm.expectRevert(err);
-        hook.afterRemoveLiquidity(address(this), key, lp, BalanceDelta.wrap(0), BalanceDelta.wrap(0), "");
         vm.expectRevert(err);
         hook.beforeDonate(address(this), key, 1, 1, "");
         vm.expectRevert(err);
@@ -317,7 +417,7 @@ contract BuyOnlyVoteHookTest is Test {
         PoolKey memory freshKey = PoolKey({
             currency0: Currency.wrap(address(0)),
             currency1: Currency.wrap(address(token)),
-            fee: 3_000,
+            fee: 0,
             tickSpacing: 60,
             hooks: IHooks(address(freshHook))
         });
@@ -491,9 +591,9 @@ contract BuyOnlyVoteHookTest is Test {
         warpTo(1, 23 hours);
         uint256 cap = out / 2;
 
-        // Ask for far more ETH than half the tokens can buy: the pool computes the input, afterSwap refuses.
+        // Ask for more ETH than half the tokens can buy: the pool computes the input, afterSwap refuses.
         SwapParams memory params = SwapParams({
-            zeroForOne: false, amountSpecified: int256(5 ether), sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+            zeroForOne: false, amountSpecified: int256(6 ether), sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
         });
         vm.expectRevert();
         vm.prank(alice);
@@ -749,17 +849,364 @@ contract BuyOnlyVoteHookTest is Test {
     }
 
     // ------------------------------------------------------------------------------------------
-    // Liquidity is not gated
+    // Sells netted against buys inside the window
     // ------------------------------------------------------------------------------------------
 
-    function test_liquidityCanBeAddedAndRemovedAtAnyTime() public {
-        lpRouter.modifyLiquidity{value: 10 ether}(
-            key, ModifyLiquidityParams({tickLower: -600, tickUpper: 600, liquidityDelta: 10e18, salt: 0}), ""
+    function test_sellAndRebuyInsideTheWindowFreesTheCapForOthers() public {
+        buy(alice, 10 ether);
+        buy(carol, 12 ether);
+        warpTo(1, 1 hours);
+        stakeAndVote(bob, quorum(), true);
+        warpTo(1, 23 hours);
+        uint256 cap = hook.sellCap(1);
+
+        // Carol sells the whole cap and immediately buys the same amount back.
+        uint256 carolSurf = token.balanceOf(carol);
+        sell(carol, cap);
+        assertEq(hook.sellRemaining(1), 0);
+        buyExactOut(carol, cap, 100 ether);
+        assertEq(token.balanceOf(carol), carolSurf, "carol is flat in SURF");
+
+        // The cap is free again for everybody else, and the round trip did not count as a buy.
+        assertEq(hook.sold(1), 0);
+        assertEq(hook.sellRemaining(1), cap);
+        assertEq(hook.bought(1), 0, "a rebuy that cancels a sell is not a new buy");
+        uint256 ethOut = sell(alice, 0.001e18);
+        assertGt(ethOut, 0);
+        assertEq(hook.sold(1), 0.001e18);
+    }
+
+    function test_repeatedSellAndRebuyCyclesCannotRaiseTomorrowsCap() public {
+        buy(alice, 10 ether);
+        warpTo(1, 1 hours);
+        stakeAndVote(bob, quorum(), true);
+        warpTo(1, 23 hours);
+        uint256 cap = hook.sellCap(1);
+        token.transfer(carol, cap);
+
+        for (uint256 i = 0; i < 5; i++) {
+            sell(carol, cap);
+            buyExactOut(carol, cap, 100 ether);
+        }
+        assertEq(hook.bought(1), 0);
+        assertEq(hook.sold(1), 0);
+        assertEq(hook.sellCap(2), 0);
+    }
+
+    function test_buyLargerThanTodaysSellsCountsOnlyTheExcess() public {
+        buy(alice, 10 ether);
+        warpTo(1, 1 hours);
+        stakeAndVote(bob, quorum(), true);
+        warpTo(1, 23 hours);
+        uint256 soldAmount = hook.sellCap(1) / 2;
+        sell(alice, soldAmount);
+        assertEq(hook.sold(1), soldAmount);
+
+        uint256 out = buyExactOut(carol, soldAmount + 1 ether, 100 ether);
+        assertEq(out, soldAmount + 1 ether);
+        assertEq(hook.sold(1), 0);
+        assertEq(hook.bought(1), 1 ether);
+        assertEq(hook.sellCap(2), 0.5 ether);
+    }
+
+    function test_buysOutsideTheWindowAreCountedInFull() public {
+        uint256 out = buy(alice, 3 ether);
+        assertEq(hook.bought(0), out);
+        assertEq(hook.sold(0), 0);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Liquidity: additions are free, removals that return less SURF than deposited are sells
+    // ------------------------------------------------------------------------------------------
+
+    function test_lpPositionCannotSellSurfOutsideTheWindow() public {
+        // Day 0: the holder buys some SURF.
+        uint256 out = buy(carol, 1 ether);
+        warpTo(2, 1 hours);
+        assertFalse(hook.sellWindowOpen());
+        assertEq(hook.sellCap(2), 0);
+
+        // Park it as SURF-only liquidity just below the price: a resting sell order.
+        uint256 surfIn = addLiquidity(carol, -120, -60, 50e18, 0);
+        assertLe(surfIn, out);
+        (uint256 liq, uint256 recorded) = hook.positions(hook.positionKey(address(lpRouter), -120, -60, 0));
+        assertEq(liq, 50e18);
+        assertEq(recorded, surfIn);
+
+        // A buy crosses the range and converts the parked SURF into ETH inside the position.
+        buy(alice, 20 ether);
+
+        // Withdrawing the ETH is a sell, and sells are closed.
+        expectRemoveRevert(
+            carol,
+            -120,
+            -60,
+            50e18,
+            hookRevert(
+                address(hook),
+                IHooks.afterRemoveLiquidity.selector,
+                abi.encodeWithSelector(BuyOnlyVoteHook.SellsClosed.selector)
+            )
         );
+        assertEq(hook.sold(2), 0);
+    }
+
+    function test_lpPositionSellIsChargedAgainstTheCapInsideTheWindow() public {
+        token.transfer(carol, 1_000 ether);
+        uint256 surfIn = addLiquidity(carol, -120, -60, 50e18, 0);
+        buy(alice, 20 ether); // crosses the range; day 0 buys are large
+        warpTo(1, 1 hours);
+        stakeAndVote(bob, quorum(), true);
+        warpTo(1, 23 hours);
+        uint256 cap = hook.sellCap(1);
+        assertGt(cap, surfIn);
+
+        uint256 ethBefore = carol.balance;
+        vm.expectEmit(true, true, true, false, address(hook));
+        emit BuyOnlyVoteHook.LiquiditySold(1, address(lpRouter), hook.positionKey(address(lpRouter), -120, -60, 0), 0);
+        (uint256 ethOut, uint256 surfOut) = removeLiquidity(carol, -120, -60, 50e18);
+        assertGt(ethOut, 0);
+        assertEq(surfOut, 0);
+        assertEq(carol.balance, ethBefore + ethOut);
+        assertEq(hook.sold(1), surfIn, "the whole deposit became ETH, so the whole deposit is charged");
+        assertEq(hook.sellRemaining(1), cap - surfIn);
+        (uint256 liq, uint256 recorded) = hook.positions(hook.positionKey(address(lpRouter), -120, -60, 0));
+        assertEq(liq, 0);
+        assertEq(recorded, 0);
+    }
+
+    function test_lpPositionSellOverTheRemainingCapIsRefused() public {
+        token.transfer(carol, 1_000 ether);
+        uint256 surfIn = addLiquidity(carol, -120, -60, 50e18, 0);
+        buy(alice, 20 ether);
+        warpTo(1, 1 hours);
+        stakeAndVote(bob, quorum(), true);
+        warpTo(1, 23 hours);
+
+        // Swappers use up most of the cap first.
+        uint256 cap = hook.sellCap(1);
+        uint256 leave = surfIn / 2;
+        sell(alice, cap - leave);
+        assertEq(hook.sellRemaining(1), leave);
+
+        expectRemoveRevert(
+            carol,
+            -120,
+            -60,
+            50e18,
+            hookRevert(
+                address(hook),
+                IHooks.afterRemoveLiquidity.selector,
+                abi.encodeWithSelector(BuyOnlyVoteHook.SellCapExceeded.selector, surfIn, leave)
+            )
+        );
+
+        // Half the position fits in what is left (proportional attribution).
+        (, uint256 surfOut) = removeLiquidity(carol, -120, -60, 25e18);
+        assertEq(surfOut, 0);
+        assertEq(hook.sold(1), cap - leave + leave, "cap fully used");
+        assertEq(hook.sellRemaining(1), 0);
+    }
+
+    function test_unchangedLiquidityCanBeRemovedAtAnyTime() public {
+        addLiquidity(address(this), -600, 600, 10e18, 10 ether);
         warpTo(5, 12 hours);
-        lpRouter.modifyLiquidity(
-            key, ModifyLiquidityParams({tickLower: -600, tickUpper: 600, liquidityDelta: -10e18, salt: 0}), ""
+        assertFalse(hook.sellWindowOpen());
+        (uint256 ethOut, uint256 surfOut) = removeLiquidity(address(this), -600, 600, 10e18);
+        assertGt(ethOut, 0);
+        assertGt(surfOut, 0);
+        (uint256 liq, uint256 recorded) = hook.positions(hook.positionKey(address(lpRouter), -600, 600, 0));
+        assertEq(liq, 0);
+        assertEq(recorded, 0);
+    }
+
+    function test_partialRemovalsOfAnUnchangedPositionAreNotSells() public {
+        uint256 surfIn = addLiquidity(address(this), -600, 600, 10e18, 10 ether);
+        warpTo(3, 12 hours);
+        (, uint256 out1) = removeLiquidity(address(this), -600, 600, 3e18);
+        (, uint256 out2) = removeLiquidity(address(this), -600, 600, 3e18);
+        (, uint256 out3) = removeLiquidity(address(this), -600, 600, 4e18);
+        assertApproxEqAbs(out1 + out2 + out3, surfIn, 10);
+        assertEq(hook.sold(3), 0);
+    }
+
+    function test_lpPositionThatGainedSurfIsNotCharged() public {
+        token.transfer(carol, 1_000 ether);
+        // Day 0: alice buys, then carol provides two-sided liquidity around the (lower) price.
+        buy(alice, 10 ether);
+        uint256 surfIn = addLiquidity(carol, -600, 600, 100e18, 100 ether);
+        // Day 1: a voted window; alice sells within the cap, pushing the price up through carol's range,
+        // which converts some of carol's ETH into SURF.
+        warpTo(1, 1 hours);
+        stakeAndVote(bob, quorum(), true);
+        warpTo(1, 23 hours);
+        sell(alice, hook.sellCap(1));
+        // Day 2, sells closed: carol can still withdraw, her position holds more SURF than she put in.
+        warpTo(2, 12 hours);
+        (, uint256 surfOut) = removeLiquidity(carol, -600, 600, 100e18);
+        assertGt(surfOut, surfIn);
+        assertEq(hook.sold(2), 0);
+    }
+
+    function test_feeCollectionOnAConvertedPositionIsNotCharged() public {
+        token.transfer(carol, 1_000 ether);
+        addLiquidity(carol, -120, -60, 50e18, 0);
+        buy(alice, 20 ether);
+        warpTo(2, 1 hours);
+        // liquidityDelta == 0 moves no principal; the pool has no fee, so nothing is collected either.
+        vm.prank(carol);
+        BalanceDelta collected = lpRouter.modifyLiquidity(
+            key, ModifyLiquidityParams({tickLower: -120, tickUpper: -60, liquidityDelta: 0, salt: 0}), ""
         );
+        assertEq(collected.amount0(), 0);
+        assertEq(collected.amount1(), 0);
+    }
+
+    function test_lpCannotInflateTheCapAndRecoverTheEthForFree() public {
+        token.transfer(carol, 1_000 ether);
+        // Carol parks SURF below the price, then buys through her own range with her own ETH.
+        uint256 parked = addLiquidity(carol, -120, -60, 50e18, 0);
+        uint256 out = buy(carol, 20 ether);
+        assertEq(hook.bought(0), out, "the buy counts like any other buy");
+        // Tomorrow's cap grew, but the ETH that landed in her position can only leave as a sell.
+        warpTo(1, 1 hours);
+        stakeAndVote(bob, quorum(), true);
+        assertFalse(hook.sellWindowOpen());
+        expectRemoveRevert(
+            carol,
+            -120,
+            -60,
+            50e18,
+            hookRevert(
+                address(hook),
+                IHooks.afterRemoveLiquidity.selector,
+                abi.encodeWithSelector(BuyOnlyVoteHook.SellsClosed.selector)
+            )
+        );
+        warpTo(1, 23 hours);
+        removeLiquidity(carol, -120, -60, 50e18);
+        assertEq(hook.sold(1), parked, "recovering the ETH consumed the cap it helped create");
+    }
+
+    function test_addingLiquidityToAConvertedPositionIsTrackedProportionally() public {
+        token.transfer(carol, 1_000 ether);
+        uint256 first = addLiquidity(carol, -120, -60, 50e18, 0);
+        buy(alice, 20 ether); // the range is now entirely ETH
+        // Adding to the same position now needs ETH only; the recorded SURF deposit does not change.
+        uint256 second = addLiquidity(carol, -120, -60, 50e18, 1 ether);
+        assertEq(second, 0);
+        (uint256 liq, uint256 recorded) = hook.positions(hook.positionKey(address(lpRouter), -120, -60, 0));
+        assertEq(liq, 100e18);
+        assertEq(recorded, first);
+
+        warpTo(1, 1 hours);
+        stakeAndVote(bob, quorum(), true);
+        warpTo(1, 23 hours);
+        // Removing half attributes half of the deposit; removing the rest attributes the rest.
+        removeLiquidity(carol, -120, -60, 50e18);
+        assertEq(hook.sold(1), first / 2);
+        removeLiquidity(carol, -120, -60, 50e18);
+        assertEq(hook.sold(1), first / 2 + (first - first / 2));
+    }
+
+    function test_positionsOfDifferentOwnersAndSaltsAreSeparate() public {
+        token.transfer(carol, 1_000 ether);
+        uint256 inA = addLiquidity(carol, -120, -60, 50e18, 0);
+        vm.prank(carol);
+        lpRouter.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({tickLower: -120, tickUpper: -60, liquidityDelta: 50e18, salt: bytes32(uint256(1))}),
+            ""
+        );
+        (uint256 liqA, uint256 recA) = hook.positions(hook.positionKey(address(lpRouter), -120, -60, 0));
+        (uint256 liqB, uint256 recB) =
+            hook.positions(hook.positionKey(address(lpRouter), -120, -60, bytes32(uint256(1))));
+        assertEq(liqA, 50e18);
+        assertEq(liqB, 50e18);
+        assertEq(recA, inA);
+        assertEq(recB, inA);
+        (uint256 liqOther,) = hook.positions(hook.positionKey(address(this), -120, -60, 0));
+        assertEq(liqOther, 0);
+    }
+
+    function test_launchStyleSeedIsAcceptedOnAFreshManagerAndCanBeWithdrawnInAWindow() public {
+        // The launch seeds SURF-only liquidity below the price and no ETH at all; that must be accepted.
+        PoolManager freshManager = new PoolManager(address(this));
+        BuyOnlyVoteHook freshHook = deployHook(freshManager);
+        PoolModifyLiquidityTest freshLp = new PoolModifyLiquidityTest(freshManager);
+        PoolSwapTest freshSwap = new PoolSwapTest(freshManager);
+        PoolKey memory freshKey = PoolKey({
+            currency0: Currency.wrap(address(0)),
+            currency1: Currency.wrap(address(token)),
+            fee: 0,
+            tickSpacing: 60,
+            hooks: IHooks(address(freshHook))
+        });
+        freshManager.initialize(freshKey, SQRT_PRICE_1_1);
+        token.approve(address(freshLp), type(uint256).max);
+        BalanceDelta seeded = freshLp.modifyLiquidity(
+            freshKey, ModifyLiquidityParams({tickLower: -60_000, tickUpper: -60, liquidityDelta: 1_000e18, salt: 0}), ""
+        );
+        uint256 surfSeeded = uint256(int256(-seeded.amount1()));
+        assertGt(surfSeeded, 0);
+
+        // A buyer converts part of the seed into ETH. Withdrawing the seed outside a window is refused.
+        vm.prank(alice);
+        freshSwap.swap{value: 1 ether}(
+            freshKey,
+            SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        vm.expectRevert(
+            hookRevert(
+                address(freshHook),
+                IHooks.afterRemoveLiquidity.selector,
+                abi.encodeWithSelector(BuyOnlyVoteHook.SellsClosed.selector)
+            )
+        );
+        freshLp.modifyLiquidity(
+            freshKey,
+            ModifyLiquidityParams({tickLower: -60_000, tickUpper: -60, liquidityDelta: -1_000e18, salt: 0}),
+            ""
+        );
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Fuzz: liquidity
+    // ------------------------------------------------------------------------------------------
+
+    function testFuzz_removingAnUntouchedPositionIsNeverASell(uint128 liquidity, uint8 lowerSteps, uint8 width) public {
+        liquidity = uint128(bound(liquidity, 1e12, 1e21));
+        int24 lower = -int24(uint24(bound(lowerSteps, 1, 200))) * 60;
+        int24 upper = lower + int24(uint24(bound(width, 1, 200))) * 60;
+        vm.deal(address(this), 100_000 ether);
+        uint256 ethNeeded = upper > 0 ? 1_000 ether : 0;
+        uint256 surfIn = addLiquidity(address(this), lower, upper, int256(uint256(liquidity)), ethNeeded);
+        warpTo(4, 5 hours);
+        assertFalse(hook.sellWindowOpen());
+        (, uint256 surfOut) = removeLiquidity(address(this), lower, upper, int256(uint256(liquidity)));
+        assertLe(surfIn, surfOut + hook.LP_ROUNDING_TOLERANCE());
+        assertEq(hook.sold(4), 0);
+    }
+
+    function testFuzz_lpShortfallIsChargedExactly(uint128 liquidity, uint96 ethIn) public {
+        token.transfer(carol, 1e24);
+        liquidity = uint128(bound(liquidity, 1e15, 1e21));
+        ethIn = uint96(bound(ethIn, 1 ether, 500 ether));
+        uint256 surfIn = addLiquidity(carol, -120, -60, int256(uint256(liquidity)), 0);
+        buy(alice, ethIn);
+        warpTo(1, 1 hours);
+        stakeAndVote(bob, quorum(), true);
+        warpTo(1, 23 hours);
+        uint256 cap = hook.sellCap(1);
+        // Make sure the cap can take the whole position so the charge itself is what is tested.
+        vm.store(address(hook), boughtSlot(0), bytes32(uint256(type(uint128).max)));
+        cap = hook.sellCap(1);
+        (, uint256 surfOut) = removeLiquidity(carol, -120, -60, int256(uint256(liquidity)));
+        uint256 expected = surfIn > surfOut + hook.LP_ROUNDING_TOLERANCE() ? surfIn - surfOut : 0;
+        assertEq(hook.sold(1), expected);
+        assertEq(hook.sellRemaining(1), cap - expected);
     }
 
     // ------------------------------------------------------------------------------------------

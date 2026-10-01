@@ -9,7 +9,7 @@ import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
-import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {BalanceDelta, BalanceDeltaLibrary} from "v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/src/types/BeforeSwapDelta.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
 
@@ -22,16 +22,25 @@ import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation
 ///  - hours 0..23 of a day: stakers may vote on whether sells open for that day;
 ///  - hour 23..24 of a day: the sell window, open only if the day's vote passed
 ///    (yes > no and yes + no >= quorum, quorum = 1% of the token supply);
-///  - during an open window the total token amount sold is capped at 50% of the tokens bought on
-///    the previous day, first come first served.
+///  - during an open window the net token amount sold is capped at 50% of the tokens bought on
+///    the previous day, first come first served. A buy made while the window is open first cancels
+///    sells already counted for the day (so a seller who buys back frees the cap again) and only the
+///    rest counts as a buy for tomorrow's cap.
 /// Buys (ETH in, SURF out) are always allowed and are recorded per day in `afterSwap`.
+///
+/// Liquidity positions are the other way SURF can turn into ETH: a position parked below the price
+/// holds SURF that every buy converts into ETH. Adding liquidity is always allowed, but the hook
+/// records the SURF each position deposits and, when liquidity is removed, treats any SURF that did
+/// not come back out (it became ETH inside the position) as a sell: it must happen in an open window
+/// and is charged against the day's cap like a swap.
 ///
 /// Voting weight is tokens staked in this contract: `stake` deposits SURF, `vote` commits the whole
 /// stake to yes or no once per day, `unstake` returns SURF but is blocked for the rest of a day in
 /// which the staker has voted, so a stake cannot vote twice in one day.
 ///
 /// There is no owner, no fee, no parameter that can be changed, and the hook binds to exactly one
-/// pool: the first pool initialized through it, whose currency0 must be native ETH.
+/// pool: the first pool initialized through it, whose currency0 must be native ETH and whose LP fee
+/// must be zero.
 contract BuyOnlyVoteHook is IHooks {
     using PoolIdLibrary for PoolKey;
     using SafeERC20 for IERC20;
@@ -51,6 +60,10 @@ contract BuyOnlyVoteHook is IHooks {
     /// @notice Quorum: total votes cast (yes + no) must reach this share of the token supply, in bps.
     uint256 public constant QUORUM_BPS = 100;
     uint256 internal constant BPS = 10_000;
+    /// @notice SURF (in wei) a liquidity removal may fall short of the position's recorded deposit
+    /// before the shortfall counts as a sell. Covers the pool's per-operation rounding (a few wei per
+    /// add or remove), nothing more: 10^6 wei is 10^-12 SURF.
+    uint256 public constant LP_ROUNDING_TOLERANCE = 1e6;
 
     // ----------------------------------------------------------------------------------------
     // State
@@ -81,6 +94,18 @@ contract BuyOnlyVoteHook is IHooks {
     /// @notice `day + 1` of the last day each account voted on (0 = never).
     mapping(address account => uint256 dayPlusOne) internal _lastVoteDayPlusOne;
 
+    /// @notice What the hook remembers about one liquidity position of the bound pool.
+    /// @param liquidity The position's current liquidity, mirrored from the pool.
+    /// @param surfIn SURF principal deposited into the position and not yet attributed to a removal.
+    struct Position {
+        uint256 liquidity;
+        uint256 surfIn;
+    }
+
+    /// @notice Positions keyed exactly as the pool manager keys them: `keccak256(owner, tickLower,
+    /// tickUpper, salt)`, where the owner is the account that called `modifyLiquidity` (a router).
+    mapping(bytes32 positionKey => Position position) public positions;
+
     // ----------------------------------------------------------------------------------------
     // Events and errors
     // ----------------------------------------------------------------------------------------
@@ -88,6 +113,9 @@ contract BuyOnlyVoteHook is IHooks {
     event PoolBound(PoolId indexed poolId, address indexed token, uint256 genesis, uint256 quorum);
     event Bought(uint256 indexed day, address indexed sender, uint256 tokenAmount);
     event Sold(uint256 indexed day, address indexed sender, uint256 tokenAmount);
+    /// @notice SURF that a liquidity removal did not return (it became ETH inside the position),
+    /// charged against the day's sell cap.
+    event LiquiditySold(uint256 indexed day, address indexed sender, bytes32 indexed positionKey, uint256 tokenAmount);
     event Staked(address indexed account, uint256 amount);
     event Unstaked(address indexed account, uint256 amount);
     event Voted(uint256 indexed day, address indexed account, bool support, uint256 weight);
@@ -97,6 +125,7 @@ contract BuyOnlyVoteHook is IHooks {
     error AlreadyInitialized();
     error NotInitialized();
     error Currency0MustBeNative();
+    error FeeMustBeZero();
     error SellsClosed();
     error SellCapExceeded(uint256 requested, uint256 remaining);
     error VotingClosed();
@@ -126,9 +155,9 @@ contract BuyOnlyVoteHook is IHooks {
             beforeInitialize: true,
             afterInitialize: false,
             beforeAddLiquidity: false,
-            afterAddLiquidity: false,
+            afterAddLiquidity: true,
             beforeRemoveLiquidity: false,
-            afterRemoveLiquidity: false,
+            afterRemoveLiquidity: true,
             beforeSwap: true,
             afterSwap: true,
             beforeDonate: false,
@@ -145,8 +174,9 @@ contract BuyOnlyVoteHook is IHooks {
     // ----------------------------------------------------------------------------------------
 
     /// @inheritdoc IHooks
-    /// @dev Binds the hook to its single pool. Only the pool manager may call it, only once, and
-    /// currency0 must be native ETH so that currency1 is unambiguously the launch token.
+    /// @dev Binds the hook to its single pool. Only the pool manager may call it, only once,
+    /// currency0 must be native ETH so that currency1 is unambiguously the launch token, and the
+    /// pool's LP fee must be zero: the brief says "no fees" and nobody can change the key afterwards.
     function beforeInitialize(address, PoolKey calldata key, uint160)
         external
         override
@@ -155,6 +185,7 @@ contract BuyOnlyVoteHook is IHooks {
     {
         if (genesis != 0) revert AlreadyInitialized();
         if (!key.currency0.isAddressZero()) revert Currency0MustBeNative();
+        if (key.fee != 0) revert FeeMustBeZero();
 
         IERC20 launchToken = IERC20(Currency.unwrap(key.currency1));
         uint256 quorum_ = (launchToken.totalSupply() * QUORUM_BPS) / BPS;
@@ -194,8 +225,11 @@ contract BuyOnlyVoteHook is IHooks {
     }
 
     /// @inheritdoc IHooks
-    /// @dev Records the token amount actually moved: buys add to today's `bought`, sells add to
-    /// today's `sold` and revert if that would exceed half of yesterday's buys.
+    /// @dev Records the token amount actually moved. A sell adds to today's `sold` and reverts if that
+    /// would exceed half of yesterday's buys. A buy first cancels SURF already counted as sold today
+    /// (only possible while the window is open: `sold[day]` is zero before it), so the cap tracks net
+    /// sells and a seller who buys back cannot hold the day's cap for everyone else; the part of the
+    /// buy that cancels a sell is not a new buy and does not raise tomorrow's cap.
     function afterSwap(address sender, PoolKey calldata, SwapParams calldata params, BalanceDelta delta, bytes calldata)
         external
         override
@@ -208,17 +242,98 @@ contract BuyOnlyVoteHook is IHooks {
         if (params.zeroForOne) {
             // Buy: the swapper receives currency1 (positive delta).
             uint256 amountOut = tokenDelta > 0 ? uint256(uint128(tokenDelta)) : 0;
-            bought[day] += amountOut;
+            uint256 soldToday = sold[day];
+            uint256 cancelled = amountOut < soldToday ? amountOut : soldToday;
+            if (cancelled != 0) sold[day] = soldToday - cancelled;
+            bought[day] += amountOut - cancelled;
             emit Bought(day, sender, amountOut);
         } else {
             // Sell: the swapper pays currency1 (negative delta).
             uint256 amountIn = tokenDelta < 0 ? uint256(uint128(-tokenDelta)) : 0;
-            uint256 remaining = sellRemaining(day);
-            if (amountIn > remaining) revert SellCapExceeded(amountIn, remaining);
-            sold[day] += amountIn;
+            _chargeSell(day, amountIn);
             emit Sold(day, sender, amountIn);
         }
         return (IHooks.afterSwap.selector, 0);
+    }
+
+    /// @inheritdoc IHooks
+    /// @dev Mirrors the position's liquidity and records the SURF principal it deposited (the delta
+    /// net of fees collected by the same call), so that a later removal can tell how much of that
+    /// SURF has turned into ETH. Adding liquidity is never refused.
+    function afterAddLiquidity(
+        address sender,
+        PoolKey calldata,
+        ModifyLiquidityParams calldata params,
+        BalanceDelta delta,
+        BalanceDelta feesAccrued,
+        bytes calldata
+    ) external override onlyPoolManager returns (bytes4, BalanceDelta) {
+        _recordAddition(
+            positionKey(sender, params.tickLower, params.tickUpper, params.salt),
+            uint256(params.liquidityDelta),
+            _principal1(delta, feesAccrued)
+        );
+        return (IHooks.afterAddLiquidity.selector, BalanceDeltaLibrary.ZERO_DELTA);
+    }
+
+    /// @inheritdoc IHooks
+    /// @dev The SURF a removal returns is compared with the share of the recorded deposit that the
+    /// removed liquidity represents. A shortfall beyond rounding tolerance is SURF that buys turned
+    /// into ETH inside the position: an economic sell, allowed only in an open window and charged
+    /// against the day's cap exactly like a swap. A surplus (ETH turned into SURF by sells) is simply
+    /// returned. Fee collection (`liquidityDelta == 0`) moves no principal and is never charged.
+    function afterRemoveLiquidity(
+        address sender,
+        PoolKey calldata,
+        ModifyLiquidityParams calldata params,
+        BalanceDelta delta,
+        BalanceDelta feesAccrued,
+        bytes calldata
+    ) external override onlyPoolManager returns (bytes4, BalanceDelta) {
+        uint256 removed = uint256(-params.liquidityDelta);
+        if (removed != 0) {
+            _settleRemoval(
+                sender,
+                positionKey(sender, params.tickLower, params.tickUpper, params.salt),
+                removed,
+                _principal1(delta, feesAccrued)
+            );
+        }
+        return (IHooks.afterRemoveLiquidity.selector, BalanceDeltaLibrary.ZERO_DELTA);
+    }
+
+    /// @dev The currency1 principal of a liquidity change: the caller's delta without the fees the
+    /// same call collected. Negative when the caller pays SURF in, positive when it takes SURF out.
+    function _principal1(BalanceDelta delta, BalanceDelta feesAccrued) internal pure returns (int256) {
+        return int256(delta.amount1()) - int256(feesAccrued.amount1());
+    }
+
+    function _recordAddition(bytes32 posKey, uint256 added, int256 principal1) internal {
+        Position storage pos = positions[posKey];
+        if (principal1 < 0) pos.surfIn += uint256(-principal1);
+        pos.liquidity += added;
+    }
+
+    function _settleRemoval(address sender, bytes32 posKey, uint256 removed, int256 principal1) internal {
+        Position storage pos = positions[posKey];
+        uint256 expected = (pos.surfIn * removed) / pos.liquidity;
+        uint256 actual = principal1 > 0 ? uint256(principal1) : 0;
+        pos.surfIn -= expected;
+        pos.liquidity -= removed;
+        if (expected > actual + LP_ROUNDING_TOLERANCE) {
+            uint256 soldAmount = expected - actual;
+            uint256 day = currentDay();
+            _chargeSell(day, soldAmount);
+            emit LiquiditySold(day, sender, posKey, soldAmount);
+        }
+    }
+
+    /// @dev Counts `amount` of SURF as sold today: the window must be open and the cap must hold it.
+    function _chargeSell(uint256 day, uint256 amount) internal {
+        if (!sellWindowOpen()) revert SellsClosed();
+        uint256 remaining = sellRemaining(day);
+        if (amount > remaining) revert SellCapExceeded(amount, remaining);
+        sold[day] += amount;
     }
 
     /// @inheritdoc IHooks
@@ -237,36 +352,12 @@ contract BuyOnlyVoteHook is IHooks {
     }
 
     /// @inheritdoc IHooks
-    function afterAddLiquidity(
-        address,
-        PoolKey calldata,
-        ModifyLiquidityParams calldata,
-        BalanceDelta,
-        BalanceDelta,
-        bytes calldata
-    ) external pure override returns (bytes4, BalanceDelta) {
-        revert HookNotImplemented();
-    }
-
-    /// @inheritdoc IHooks
     function beforeRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
         external
         pure
         override
         returns (bytes4)
     {
-        revert HookNotImplemented();
-    }
-
-    /// @inheritdoc IHooks
-    function afterRemoveLiquidity(
-        address,
-        PoolKey calldata,
-        ModifyLiquidityParams calldata,
-        BalanceDelta,
-        BalanceDelta,
-        bytes calldata
-    ) external pure override returns (bytes4, BalanceDelta) {
         revert HookNotImplemented();
     }
 
@@ -373,6 +464,12 @@ contract BuyOnlyVoteHook is IHooks {
         uint256 cap = sellCap(day);
         uint256 used = sold[day];
         return used >= cap ? 0 : cap - used;
+    }
+
+    /// @notice The key under which the pool manager (and this hook) stores a liquidity position.
+    /// @param owner The account that calls `modifyLiquidity` on the pool manager (a router or position manager).
+    function positionKey(address owner, int24 tickLower, int24 tickUpper, bytes32 salt) public pure returns (bytes32) {
+        return keccak256(abi.encodePacked(owner, tickLower, tickUpper, salt));
     }
 
     /// @notice The last day index on which `account` voted, and whether it ever has.
