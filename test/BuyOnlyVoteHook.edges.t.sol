@@ -25,16 +25,22 @@ import {HookMiner} from "../src/HookMiner.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 
 /// @notice Adversarial edges the main suite does not reach: boundary seconds, partial fills, rounding,
-/// exact-output sells against a spent cap, wash trades inside the window, and the pool operations the
-/// hook does not gate. Companion to `BuyOnlyVoteHook.t.sol`; nothing here is duplicated from it.
+/// exact-output sells against a spent cap, the netting of buys against today's sells to the wei, the
+/// liquidity rule at its two exact boundaries (the rounding tolerance and the remaining cap), donations
+/// as a way to dress up a converted position, and the pool operations the hook does not gate. Companion
+/// to `BuyOnlyVoteHook.t.sol`; nothing here is duplicated from it.
 /// forge-config: default.fuzz.runs = 512
 contract BuyOnlyVoteHookEdgesTest is Test {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
 
     uint160 constant SQRT_PRICE_1_1 = 79228162514264337593543950336;
-    uint160 constant FLAGS = HookFlags.BEFORE_INITIALIZE | HookFlags.BEFORE_SWAP | HookFlags.AFTER_SWAP;
+    uint160 constant FLAGS = HookFlags.BEFORE_INITIALIZE | HookFlags.AFTER_ADD_LIQUIDITY
+        | HookFlags.AFTER_REMOVE_LIQUIDITY | HookFlags.BEFORE_SWAP | HookFlags.AFTER_SWAP;
     uint256 constant START = 1_700_000_000;
+    /// @dev Storage slots of the hook's mappings, in declaration order (the pool manager is immutable).
+    uint256 constant BOUGHT_SLOT = 4;
+    uint256 constant POSITIONS_SLOT = 10;
 
     PoolManager manager;
     SurfToken token;
@@ -64,7 +70,7 @@ contract BuyOnlyVoteHookEdgesTest is Test {
         key = PoolKey({
             currency0: Currency.wrap(address(0)),
             currency1: Currency.wrap(address(token)),
-            fee: 3_000,
+            fee: 0,
             tickSpacing: 60,
             hooks: IHooks(address(hook))
         });
@@ -161,6 +167,65 @@ contract BuyOnlyVoteHookEdgesTest is Test {
         vm.expectRevert(reason);
         vm.prank(user);
         swapRouter.swap(key, params, settings(), "");
+    }
+
+    /// @dev Adds `liquidity` for `user` (salt 0) and returns the SURF it deposited.
+    function addLiquidity(address user, int24 lower, int24 upper, int256 liquidity, uint256 ethValue)
+        internal
+        returns (uint256 surfIn)
+    {
+        vm.deal(user, user.balance + ethValue);
+        vm.prank(user);
+        BalanceDelta delta = lpRouter.modifyLiquidity{value: ethValue}(
+            key, ModifyLiquidityParams({tickLower: lower, tickUpper: upper, liquidityDelta: liquidity, salt: 0}), ""
+        );
+        surfIn = delta.amount1() < 0 ? uint256(int256(-delta.amount1())) : 0;
+    }
+
+    /// @dev Removes `liquidity` for `user` (salt 0) and returns the ETH and SURF it paid out.
+    function removeLiquidity(address user, int24 lower, int24 upper, int256 liquidity)
+        internal
+        returns (uint256 ethOut, uint256 surfOut)
+    {
+        vm.prank(user);
+        BalanceDelta delta = lpRouter.modifyLiquidity(
+            key, ModifyLiquidityParams({tickLower: lower, tickUpper: upper, liquidityDelta: -liquidity, salt: 0}), ""
+        );
+        ethOut = delta.amount0() > 0 ? uint256(int256(delta.amount0())) : 0;
+        surfOut = delta.amount1() > 0 ? uint256(int256(delta.amount1())) : 0;
+    }
+
+    function expectRemoveRevert(address user, int24 lower, int24 upper, int256 liquidity, bytes memory reason)
+        internal
+    {
+        vm.expectRevert(reason);
+        vm.prank(user);
+        lpRouter.modifyLiquidity(
+            key, ModifyLiquidityParams({tickLower: lower, tickUpper: upper, liquidityDelta: -liquidity, salt: 0}), ""
+        );
+    }
+
+    function lpKey(int24 lower, int24 upper) internal view returns (bytes32) {
+        return hook.positionKey(address(lpRouter), lower, upper, 0);
+    }
+
+    /// @dev Overwrite `bought[day]`, checking first that the slot really is the one the getter reads.
+    function setBought(uint256 day, uint256 value) internal {
+        bytes32 slot = keccak256(abi.encode(day, BOUGHT_SLOT));
+        assertEq(uint256(vm.load(address(hook), slot)), hook.bought(day), "bought slot");
+        vm.store(address(hook), slot, bytes32(value));
+        assertEq(hook.bought(day), value);
+    }
+
+    /// @dev Overwrite a position's recorded SURF deposit, checking the slot the same way.
+    function setSurfIn(bytes32 positionKey, uint256 value) internal {
+        bytes32 slot = bytes32(uint256(keccak256(abi.encode(positionKey, POSITIONS_SLOT))) + 1);
+        (uint256 liq, uint256 surfIn) = hook.positions(positionKey);
+        assertEq(uint256(vm.load(address(hook), slot)), surfIn, "surfIn slot");
+        assertEq(uint256(vm.load(address(hook), bytes32(uint256(slot) - 1))), liq, "liquidity slot");
+        vm.store(address(hook), slot, bytes32(value));
+        (, uint256 after_) = hook.positions(positionKey);
+        assertEq(after_, value);
     }
 
     function fundAndStake(address user, uint256 amount) internal {
@@ -439,22 +504,88 @@ contract BuyOnlyVoteHookEdgesTest is Test {
         assertEq(hook.sellCap(2), out1 / 2, "tomorrow's cap counts the window-hour buy");
     }
 
-    function test_washTradeInsideTheWindowCannotRaiseTodaysCap() public {
+    /// @dev The netting rule, to the wei: a buy inside the window cancels today's sells first, and only
+    /// the excess is a buy for tomorrow's cap.
+    function testFuzz_aBuyInsideTheWindowCancelsTodaysSellsFirst(uint96 sellSeed, uint96 buySeed) public {
+        uint256 out = openDayOneWindow(10 ether, 23 hours);
+        uint256 cap = out / 2;
+        uint256 sellAmount = bound(sellSeed, 1, cap);
+        uint256 buyAmount = bound(buySeed, 1, 2 * cap);
+        sell(alice, sellAmount);
+        assertEq(hook.sold(1), sellAmount);
+        buyExactTokens(carol, buyAmount, 100 ether);
+
+        uint256 cancelled = buyAmount < sellAmount ? buyAmount : sellAmount;
+        assertEq(hook.sold(1), sellAmount - cancelled, "sold is reduced by the buy, never below zero");
+        assertEq(hook.bought(1), buyAmount - cancelled, "only the excess is a buy");
+        assertEq(hook.sellRemaining(1), cap - (sellAmount - cancelled));
+        assertEq(hook.sellCap(2), (buyAmount - cancelled) / 2, "tomorrow's cap is half of the net buy");
+    }
+
+    function test_buyExactlyEqualToTodaysSellsZeroesBothCounters() public {
         uint256 out = openDayOneWindow(10 ether, 23 hours);
         uint256 cap = out / 2;
         sell(alice, cap);
-        uint256 rebought = buy(alice, 5 ether);
-        assertEq(hook.bought(1), rebought);
-        assertEq(hook.sellRemaining(1), 0, "buying back inside the window does not refill today's cap");
+        buyExactTokens(carol, cap, 100 ether);
+        assertEq(hook.sold(1), 0);
+        assertEq(hook.bought(1), 0);
+        assertEq(hook.sellRemaining(1), cap);
+        assertEq(hook.sellCap(2), 0);
+        // The next wei bought is a real buy.
+        buyExactTokens(carol, 1, 1 ether);
+        assertEq(hook.bought(1), 1);
+        assertEq(hook.sold(1), 0);
+    }
+
+    function test_buyOneWeiShortOfTodaysSellsLeavesOneWeiSold() public {
+        uint256 out = openDayOneWindow(10 ether, 23 hours);
+        uint256 cap = out / 2;
+        sell(alice, cap);
+        buyExactTokens(carol, cap - 1, 100 ether);
+        assertEq(hook.sold(1), 1);
+        assertEq(hook.bought(1), 0);
+        assertEq(hook.sellRemaining(1), cap - 1);
+        // Exactly one more wei can still be sold today, and not two.
         expectSellRevert(
             alice,
-            sellParams(1),
+            sellParams(cap),
             hookRevert(
-                IHooks.beforeSwap.selector, abi.encodeWithSelector(BuyOnlyVoteHook.SellCapExceeded.selector, 1, 0)
+                IHooks.beforeSwap.selector,
+                abi.encodeWithSelector(BuyOnlyVoteHook.SellCapExceeded.selector, cap, cap - 1)
             )
         );
-        // Tomorrow's cap is half of today's buys, which the buy-back is part of. This is the rule as briefed.
-        assertEq(hook.sellCap(2), rebought / 2);
+        sell(alice, cap - 1);
+        assertEq(hook.sellRemaining(1), 0);
+    }
+
+    function test_buysOutsideTheWindowNeverCancelAnything() public {
+        uint256 out = openDayOneWindow(10 ether, 23 hours);
+        sell(alice, out / 4);
+        // The window closes at midnight; what was sold on day 1 stays sold, and day 2 starts clean.
+        warpTo(2, 0);
+        uint256 rebought = buy(carol, 1 ether);
+        assertEq(hook.sold(1), out / 4, "yesterday's sells are final");
+        assertEq(hook.sold(2), 0);
+        assertEq(hook.bought(2), rebought, "a buy outside a window counts in full");
+    }
+
+    /// @dev Characterisation of the netting rule's limit (see REVIEW.md, "Residual"): with matching buys
+    /// between them, several sellers can each sell the whole cap in one window. The net sell stays
+    /// capped; the gross volume is not. This is the accepted design, recorded here so that it is visible.
+    function test_grossSellsInsideAWindowAreBoundedOnlyNetOfBuys() public {
+        uint256 out = openDayOneWindow(10 ether, 23 hours);
+        uint256 cap = out / 2;
+        token.transfer(bob, cap);
+        token.transfer(carol, cap);
+        address[3] memory sellers = [alice, bob, carol];
+        for (uint256 i = 0; i < sellers.length; i++) {
+            sell(sellers[i], cap);
+            assertEq(hook.sellRemaining(1), 0);
+            if (i + 1 < sellers.length) buyExactTokens(sellers[i], cap, 100 ether);
+        }
+        assertEq(hook.sold(1), cap, "net sells are at the cap");
+        assertEq(hook.bought(1), 0, "the matching buys were all cancellations");
+        assertEq(hook.sellCap(2), 0);
     }
 
     function test_hookHoldsNoEthAndOnlyStakedTokensAfterTrading() public {
@@ -582,7 +713,7 @@ contract BuyOnlyVoteHookEdgesTest is Test {
         PoolKey memory k = PoolKey({
             currency0: Currency.wrap(address(0)),
             currency1: Currency.wrap(address(small)),
-            fee: 3_000,
+            fee: 0,
             tickSpacing: 60,
             hooks: IHooks(address(fresh))
         });
@@ -600,7 +731,7 @@ contract BuyOnlyVoteHookEdgesTest is Test {
         PoolKey memory k = PoolKey({
             currency0: Currency.wrap(address(0)),
             currency1: Currency.wrap(address(tiny)),
-            fee: 3_000,
+            fee: 0,
             tickSpacing: 60,
             hooks: IHooks(address(fresh))
         });
@@ -623,18 +754,192 @@ contract BuyOnlyVoteHookEdgesTest is Test {
         assertEq(hook.sold(3), 0);
     }
 
-    function test_liquidityCanBeRemovedWhileSellsAreClosed() public {
-        token.transfer(alice, 100 ether);
-        vm.prank(alice);
-        lpRouter.modifyLiquidity{value: 10 ether}(
-            key, ModifyLiquidityParams({tickLower: -600, tickUpper: 600, liquidityDelta: 10e18, salt: 0}), ""
-        );
-        warpTo(1, 12 hours);
+    // ------------------------------------------------------------------------------------------
+    // Liquidity removals at the exact boundaries of the rule
+    // ------------------------------------------------------------------------------------------
+
+    /// @dev A removal may fall short of the recorded deposit by exactly the tolerance for free; one wei
+    /// more is a sell. The deposit record is set directly so the boundary is hit exactly, since the pool's
+    /// own rounding only ever produces a wei or two.
+    function test_lpRoundingToleranceIsExactlyOneMillionWei() public {
+        token.transfer(carol, 1_000 ether);
+        uint256 surfIn = addLiquidity(carol, -600, 600, 10e18, 10 ether);
+        bytes32 k = lpKey(-600, 600);
+        uint256 tolerance = hook.LP_ROUNDING_TOLERANCE();
+        assertEq(tolerance, 1e6);
+
+        // Measure what the untouched position pays back (a wei or two under the deposit).
+        warpTo(2, 12 hours);
         assertFalse(hook.sellWindowOpen());
-        vm.prank(alice);
-        lpRouter.modifyLiquidity(
-            key, ModifyLiquidityParams({tickLower: -600, tickUpper: 600, liquidityDelta: -10e18, salt: 0}), ""
+        uint256 snapshot = vm.snapshotState();
+        (, uint256 surfOut) = removeLiquidity(carol, -600, 600, 10e18);
+        assertLe(surfIn - surfOut, 2, "test premise: rounding is tiny");
+        assertEq(hook.sold(2), 0);
+        vm.revertToState(snapshot);
+
+        // Shortfall == tolerance: free, even with the window closed.
+        setSurfIn(k, surfOut + tolerance);
+        snapshot = vm.snapshotState();
+        removeLiquidity(carol, -600, 600, 10e18);
+        assertEq(hook.sold(2), 0, "a shortfall of exactly the tolerance is not a sell");
+        (uint256 liq, uint256 rec) = hook.positions(k);
+        assertEq(liq, 0);
+        assertEq(rec, 0);
+        vm.revertToState(snapshot);
+
+        // Shortfall == tolerance + 1: a sell, so refused while closed...
+        setSurfIn(k, surfOut + tolerance + 1);
+        expectRemoveRevert(
+            carol,
+            -600,
+            600,
+            10e18,
+            hookRevert(
+                IHooks.afterRemoveLiquidity.selector, abi.encodeWithSelector(BuyOnlyVoteHook.SellsClosed.selector)
+            )
         );
-        assertEq(hook.sold(1), 0, "liquidity removal is not a recorded sell");
+        // ...and charged in full, not just the part over the tolerance, once a window with cap is open.
+        stakeAndVote(bob, q, true);
+        warpTo(2, 23 hours);
+        setBought(1, 4 * (tolerance + 1));
+        removeLiquidity(carol, -600, 600, 10e18);
+        assertEq(hook.sold(2), tolerance + 1);
+    }
+
+    /// @dev The cap boundary for a liquidity sell: a shortfall equal to what remains passes, one wei over
+    /// is refused with the exact figures.
+    function test_lpShortfallExactlyAtTheRemainingCapPassesAndOneWeiOverFails() public {
+        token.transfer(carol, 1_000 ether);
+        uint256 parked = addLiquidity(carol, -120, -60, 50e18, 0);
+        buy(alice, 20 ether);
+        (, int24 tick,,) = IPoolManager(address(manager)).getSlot0(key.toId());
+        assertLt(tick, -120, "test premise: the range is entirely ETH, so the whole deposit is the shortfall");
+        warpTo(1, 1 hours);
+        stakeAndVote(bob, q, true);
+        warpTo(1, 23 hours);
+
+        setBought(0, 2 * parked - 2);
+        assertEq(hook.sellCap(1), parked - 1);
+        expectRemoveRevert(
+            carol,
+            -120,
+            -60,
+            50e18,
+            hookRevert(
+                IHooks.afterRemoveLiquidity.selector,
+                abi.encodeWithSelector(BuyOnlyVoteHook.SellCapExceeded.selector, parked, parked - 1)
+            )
+        );
+        assertEq(hook.sold(1), 0, "a refused removal records nothing");
+
+        setBought(0, 2 * parked);
+        assertEq(hook.sellCap(1), parked);
+        (uint256 ethOut, uint256 surfOut) = removeLiquidity(carol, -120, -60, 50e18);
+        assertGt(ethOut, 0);
+        assertEq(surfOut, 0);
+        assertEq(hook.sold(1), parked);
+        assertEq(hook.sellRemaining(1), 0);
+    }
+
+    /// @dev A liquidity charge is `sold` like any other and is netted by a later buy the same way.
+    function test_aLiquidityChargeIsCancelledByABuyLikeASwapSell() public {
+        token.transfer(carol, 1_000 ether);
+        uint256 parked = addLiquidity(carol, -120, -60, 50e18, 0);
+        buy(alice, 20 ether);
+        warpTo(1, 1 hours);
+        stakeAndVote(bob, q, true);
+        warpTo(1, 23 hours);
+        uint256 cap = hook.sellCap(1);
+        assertGt(cap, parked, "test premise: the cap can take the position");
+
+        removeLiquidity(carol, -120, -60, 50e18);
+        assertEq(hook.sold(1), parked);
+        buyExactTokens(bob, parked, 100 ether);
+        assertEq(hook.sold(1), 0);
+        assertEq(hook.bought(1), 0);
+        assertEq(hook.sellRemaining(1), cap);
+    }
+
+    /// @dev SURF donated to a partly converted position comes back out as fees. It must not count as the
+    /// position's own SURF: the shortfall is measured on principal, so the removal is still a sell.
+    function test_donatedSurfDoesNotMaskAnLpShortfall() public {
+        token.transfer(carol, 1_000 ether);
+        uint256 surfIn = addLiquidity(carol, -120, -60, 5e18, 0);
+        bytes32 k = lpKey(-120, -60);
+
+        // Buy down to tick -90: half the position has turned into ETH and it is still in range.
+        vm.prank(alice);
+        swapRouter.swap{value: 100 ether}(
+            key,
+            SwapParams({
+                zeroForOne: true, amountSpecified: -100 ether, sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(-90)
+            }),
+            settings(),
+            ""
+        );
+        (, int24 tick,,) = IPoolManager(address(manager)).getSlot0(key.toId());
+        assertTrue(tick >= -120 && tick < -60, "test premise: the position is in range");
+
+        // What the principal alone pays back now (measured with the deposit record cleared, then undone).
+        uint256 snapshot = vm.snapshotState();
+        setSurfIn(k, 0);
+        (, uint256 principalOut) = removeLiquidity(carol, -120, -60, 5e18);
+        vm.revertToState(snapshot);
+        uint256 shortfall = surfIn - principalOut;
+        assertGt(shortfall, hook.LP_ROUNDING_TOLERANCE(), "test premise: a real shortfall");
+
+        // Donate SURF: the in-range position accrues it as fees.
+        donateRouter.donate(key, 0, 10 ether, "");
+
+        // Outside a window the removal is still a sell.
+        assertFalse(hook.sellWindowOpen());
+        expectRemoveRevert(
+            carol,
+            -120,
+            -60,
+            5e18,
+            hookRevert(
+                IHooks.afterRemoveLiquidity.selector, abi.encodeWithSelector(BuyOnlyVoteHook.SellsClosed.selector)
+            )
+        );
+
+        // Inside one, the charge is the principal shortfall; the donation is paid out on top, uncharged.
+        warpTo(1, 1 hours);
+        stakeAndVote(bob, q, true);
+        warpTo(1, 23 hours);
+        setBought(0, 4 * shortfall);
+        (, uint256 surfOut) = removeLiquidity(carol, -120, -60, 5e18);
+        assertGt(surfOut, principalOut, "the donated fees were paid out");
+        assertEq(hook.sold(1), shortfall, "charged on principal only");
+    }
+
+    /// @dev A position that is removed and re-opened starts a fresh deposit record; nothing from the old
+    /// life (charged or not) carries over.
+    function test_reopenedPositionStartsAFreshRecord() public {
+        token.transfer(carol, 1_000 ether);
+        bytes32 k = lpKey(-120, -60);
+        uint256 first = addLiquidity(carol, -120, -60, 50e18, 0);
+        buy(alice, 20 ether);
+        warpTo(1, 1 hours);
+        stakeAndVote(bob, q, true);
+        warpTo(1, 23 hours);
+        removeLiquidity(carol, -120, -60, 50e18);
+        assertEq(hook.sold(1), first);
+        (uint256 liq, uint256 rec) = hook.positions(k);
+        assertEq(liq, 0);
+        assertEq(rec, 0);
+
+        // The range is now entirely ETH, so re-opening it deposits ETH only: the record stays at zero
+        // SURF and a later removal is free, whatever the window says.
+        uint256 second = addLiquidity(carol, -120, -60, 50e18, 10 ether);
+        assertEq(second, 0);
+        (liq, rec) = hook.positions(k);
+        assertEq(liq, 50e18);
+        assertEq(rec, 0);
+        warpTo(3, 12 hours);
+        assertFalse(hook.sellWindowOpen());
+        (uint256 ethOut,) = removeLiquidity(carol, -120, -60, 50e18);
+        assertGt(ethOut, 0);
+        assertEq(hook.sold(3), 0);
     }
 }

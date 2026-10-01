@@ -7,8 +7,11 @@ import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {SqrtPriceMath} from "v4-core/src/libraries/SqrtPriceMath.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {CustomRevert} from "v4-core/src/libraries/CustomRevert.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
@@ -23,17 +26,43 @@ import {HookMiner} from "../src/HookMiner.sol";
 /// @notice Drives the hook with random, bounded call sequences from three actors and predicts the outcome
 /// of every call. The run is configured with `fail_on_revert`, so a revert the handler did not predict
 /// (a buy that fails, a sell refused while the window is open and under cap, an unstake refused without a
-/// vote) fails the campaign instead of being silently skipped.
+/// vote, a liquidity removal refused although it returns all the SURF it deposited) fails the campaign
+/// instead of being silently skipped.
+///
+/// Liquidity is the second value path the hook gates: each actor owns up to six positions (one per range
+/// of a fixed menu, salted with the actor's address so they are separate in the pool manager), adds to
+/// them at any time and removes any part of them. Before a removal the handler recomputes, with the
+/// pool's own `SqrtPriceMath`, the SURF the pool will hand back, and from that the shortfall the hook
+/// must charge; the call is then required to succeed or fail exactly as the sell rules say.
 contract BuyOnlyVoteHookHandler is Test {
+    using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
+
     uint256 public constant ACTOR_FUNDING = 20_000_000 ether; // twice the quorum each
 
     PoolManager public manager;
     SurfToken public token;
     BuyOnlyVoteHook public hook;
     PoolSwapTest public swapRouter;
+    PoolModifyLiquidityTest public lpRouter;
     PoolKey key;
+    PoolId poolId;
 
     address[] public actors;
+
+    /// @dev Tick ranges liquidity is added to (tick spacing 60). Relative to the genesis price (tick 0):
+    /// full range, symmetric, parked SURF below, further below, parked ETH above, tight around.
+    int24[6] internal lowers = [int24(-887_220), -600, -120, -1_200, 60, -60];
+    int24[6] internal uppers = [int24(887_220), 600, -60, -600, 120, 60];
+
+    struct TrackedPosition {
+        address actor;
+        int24 lower;
+        int24 upper;
+    }
+
+    TrackedPosition[] public tracked;
+    mapping(bytes32 => bool) internal isTracked;
 
     // ---- ghost state ------------------------------------------------------------------------------
     uint256 public ghostTotalStaked;
@@ -42,12 +71,27 @@ contract BuyOnlyVoteHookHandler is Test {
     mapping(address => uint256) public ghostVoteDayPlusOne; // day + 1 of the actor's last vote
     mapping(address => uint256) public ghostStakeAtVote; // stake committed by that vote
 
-    mapping(uint256 => uint256) public ghostBought;
-    mapping(uint256 => uint256) public ghostSold;
+    mapping(uint256 => uint256) public ghostBought; // net of the sells it cancelled, as the hook counts
+    mapping(uint256 => uint256) public ghostGrossBought; // every SURF that left the pool through a buy
+    mapping(uint256 => uint256) public ghostSold; // net: swap sells + LP charges - cancelled by buys
+    mapping(uint256 => uint256) public ghostSwapSold;
+    mapping(uint256 => uint256) public ghostLpSold;
+    mapping(uint256 => uint256) public ghostCancelled;
     mapping(uint256 => uint256) public ghostYes;
     mapping(uint256 => uint256) public ghostNo;
     mapping(uint256 => uint256) public ghostVotesCast;
     mapping(uint256 => bool) public ghostWindowSeenOpen;
+
+    /// @dev SURF deposited into each position since it was last empty, and SURF it has paid back out.
+    mapping(bytes32 => uint256) public ghostSurfDeposited;
+    mapping(bytes32 => uint256) public ghostSurfReturned;
+    /// @dev Shortfalls within the rounding tolerance that were (rightly) not charged: the only SURF that
+    /// can ever turn into ETH outside the rules, bounded by the tolerance per removal.
+    uint256 public ghostUnchargedShortfall;
+    uint256 public ghostRemovalsSettled;
+    /// @dev ETH an actor withdrew from a position while the window was closed; all of it must have been
+    /// backed by a SURF-neutral position (asserted in place), never by SURF that became ETH.
+    uint256 public ghostEthOutOfLpWhileClosed;
 
     // A day whose data is frozen once the clock has moved past it.
     mapping(uint256 => bool) public frozen;
@@ -68,6 +112,11 @@ contract BuyOnlyVoteHookHandler is Test {
     uint256 public votesRefused;
     uint256 public unstakesDone;
     uint256 public unstakesLocked;
+    uint256 public lpAdds;
+    uint256 public lpRemovesFree;
+    uint256 public lpRemovesCharged;
+    uint256 public lpRemovesClosed;
+    uint256 public lpRemovesOverCap;
 
     receive() external payable {}
 
@@ -76,13 +125,16 @@ contract BuyOnlyVoteHookHandler is Test {
         SurfToken _token,
         BuyOnlyVoteHook _hook,
         PoolSwapTest _swapRouter,
+        PoolModifyLiquidityTest _lpRouter,
         PoolKey memory _key
     ) {
         manager = _manager;
         token = _token;
         hook = _hook;
         swapRouter = _swapRouter;
+        lpRouter = _lpRouter;
         key = _key;
+        poolId = _key.toId();
 
         actors.push(makeAddr("actor-alice"));
         actors.push(makeAddr("actor-bob"));
@@ -91,6 +143,7 @@ contract BuyOnlyVoteHookHandler is Test {
             vm.deal(actors[i], 10_000 ether);
             vm.startPrank(actors[i]);
             token.approve(address(swapRouter), type(uint256).max);
+            token.approve(address(lpRouter), type(uint256).max);
             token.approve(address(hook), type(uint256).max);
             vm.stopPrank();
         }
@@ -107,10 +160,22 @@ contract BuyOnlyVoteHookHandler is Test {
         return actors.length;
     }
 
+    function trackedCount() external view returns (uint256) {
+        return tracked.length;
+    }
+
     // ---- helpers ----------------------------------------------------------------------------------
 
     function pick(uint256 seed) internal view returns (address) {
         return actors[seed % actors.length];
+    }
+
+    function salt(address actor) internal pure returns (bytes32) {
+        return bytes32(uint256(uint160(actor)));
+    }
+
+    function posKey(address actor, int24 lower, int24 upper) public view returns (bytes32) {
+        return hook.positionKey(address(lpRouter), lower, upper, salt(actor));
     }
 
     function hookRevert(bytes4 callback, bytes memory reason) internal view returns (bytes memory) {
@@ -137,6 +202,26 @@ contract BuyOnlyVoteHookHandler is Test {
         }
         lastSeenDay = day;
         if (day > maxDaySeen) maxDaySeen = day;
+    }
+
+    /// @dev The amounts the pool moves for a liquidity change of `liquidity` on [lower, upper], computed
+    /// exactly as `Pool.modifyLiquidity` does (rounded up when depositing, down when withdrawing).
+    function poolAmounts(int24 lower, int24 upper, uint128 liquidity, bool deposit)
+        public
+        view
+        returns (uint256 amount0, uint256 amount1)
+    {
+        (uint160 sqrtPriceX96, int24 tick,,) = IPoolManager(address(manager)).getSlot0(poolId);
+        uint160 sqrtLower = TickMath.getSqrtPriceAtTick(lower);
+        uint160 sqrtUpper = TickMath.getSqrtPriceAtTick(upper);
+        if (tick < lower) {
+            amount0 = SqrtPriceMath.getAmount0Delta(sqrtLower, sqrtUpper, liquidity, deposit);
+        } else if (tick < upper) {
+            amount0 = SqrtPriceMath.getAmount0Delta(sqrtPriceX96, sqrtUpper, liquidity, deposit);
+            amount1 = SqrtPriceMath.getAmount1Delta(sqrtLower, sqrtPriceX96, liquidity, deposit);
+        } else {
+            amount1 = SqrtPriceMath.getAmount1Delta(sqrtLower, sqrtUpper, liquidity, deposit);
+        }
     }
 
     // ---- actions ----------------------------------------------------------------------------------
@@ -247,12 +332,14 @@ contract BuyOnlyVoteHookHandler is Test {
         }
     }
 
-    /// @notice A buy must always succeed, whatever the day, the vote or the cap says.
+    /// @notice A buy must always succeed, whatever the day, the vote or the cap says. Inside an open
+    /// window it first cancels SURF counted as sold today; only the rest is a buy for tomorrow's cap.
     function buy(uint256 actorSeed, uint256 ethIn, bool exactOutput) external {
         address actor = pick(actorSeed);
         ethIn = bound(ethIn, 0.0001 ether, 20 ether);
         uint256 day = hook.currentDay();
         uint256 boughtBefore = hook.bought(day);
+        uint256 soldBefore = hook.sold(day);
         uint256 tokensBefore = token.balanceOf(actor);
 
         SwapParams memory params = SwapParams({
@@ -269,9 +356,15 @@ contract BuyOnlyVoteHookHandler is Test {
             BalanceDelta delta
         ) {
             uint256 out = uint256(int256(delta.amount1()));
+            uint256 cancelled = out < soldBefore ? out : soldBefore;
             assertEq(token.balanceOf(actor), tokensBefore + out, "buyer did not receive the delta");
-            assertEq(hook.bought(day), boughtBefore + out, "bought[day] did not grow by the tokens received");
-            ghostBought[day] += out;
+            assertEq(hook.sold(day), soldBefore - cancelled, "a buy must cancel today's sells first");
+            assertEq(hook.bought(day), boughtBefore + out - cancelled, "bought[day] must grow by the net buy");
+            if (!hook.sellWindowOpen()) assertEq(cancelled, 0, "nothing to cancel outside a window");
+            ghostBought[day] += out - cancelled;
+            ghostGrossBought[day] += out;
+            ghostSold[day] -= cancelled;
+            ghostCancelled[day] += cancelled;
             buys++;
         } catch (bytes memory err) {
             // Only the router's own insufficient-ETH guard may stop an exact-output buy; the hook never may.
@@ -329,6 +422,7 @@ contract BuyOnlyVoteHookHandler is Test {
             assertGe(actor.balance, ethBefore, "seller lost ETH on a sell");
             assertEq(hook.sold(day), soldBefore + paid, "sold[day] did not grow by the tokens paid");
             ghostSold[day] += paid;
+            ghostSwapSold[day] += paid;
             sellsDone++;
         } catch (bytes memory err) {
             assertGt(expected.length, 0, "sell refused although the window is open and the amount fits the cap");
@@ -338,14 +432,189 @@ contract BuyOnlyVoteHookHandler is Test {
             else sellsClosed++;
         }
     }
+
+    /// @notice Adding liquidity is never refused, at any time, in any range, and the hook records exactly
+    /// the SURF the position took in.
+    function addLiquidity(uint256 actorSeed, uint256 rangeSeed, uint256 liquiditySeed) external {
+        LpCall memory c;
+        c.actor = pick(actorSeed);
+        (c.lower, c.upper) = (lowers[rangeSeed % lowers.length], uppers[rangeSeed % lowers.length]);
+        c.amount = bound(liquiditySeed, 1e15, 1e21);
+        c.k = posKey(c.actor, c.lower, c.upper);
+
+        (c.eth0, c.surf1) = poolAmounts(c.lower, c.upper, uint128(c.amount), true);
+        if (c.surf1 > token.balanceOf(c.actor)) return;
+        vm.deal(c.actor, c.actor.balance + c.eth0 + 1);
+
+        (c.liqBefore, c.surfInBefore) = hook.positions(c.k);
+        c.surfBefore = token.balanceOf(c.actor);
+
+        vm.prank(c.actor);
+        BalanceDelta delta = lpRouter.modifyLiquidity{value: c.eth0 + 1}(key, lpParams(c, int256(c.amount)), "");
+        uint256 surfPaid = delta.amount1() < 0 ? uint256(int256(-delta.amount1())) : 0;
+        assertEq(surfPaid, c.surf1, "predicted SURF deposit");
+        assertEq(uint256(int256(-delta.amount0())), c.eth0, "predicted ETH deposit");
+        assertEq(token.balanceOf(c.actor), c.surfBefore - surfPaid, "LP SURF balance");
+
+        (uint256 liqAfter, uint256 surfInAfter) = hook.positions(c.k);
+        assertEq(liqAfter, c.liqBefore + c.amount, "position liquidity mirror");
+        assertEq(surfInAfter, c.surfInBefore + surfPaid, "position SURF deposit record");
+
+        if (!isTracked[c.k]) {
+            isTracked[c.k] = true;
+            tracked.push(TrackedPosition({actor: c.actor, lower: c.lower, upper: c.upper}));
+        }
+        ghostSurfDeposited[c.k] += surfPaid;
+        lpAdds++;
+    }
+
+    /// @dev Everything one liquidity call needs, kept off the stack.
+    struct LpCall {
+        address actor;
+        int24 lower;
+        int24 upper;
+        bytes32 k;
+        uint256 amount; // liquidity added or removed
+        uint256 eth0;
+        uint256 surf1; // predicted SURF moved by the pool
+        uint256 liqBefore;
+        uint256 surfInBefore;
+        uint256 surfBefore;
+        uint256 ethBefore;
+        uint256 day;
+        bool open;
+        uint256 remaining;
+        uint256 expectedSurf; // the removed share of the recorded deposit
+        uint256 shortfall; // what the hook must charge, zero within tolerance
+        uint256 soldBefore;
+        bytes expectedErr;
+    }
+
+    function lpParams(LpCall memory c, int256 liquidityDelta) internal pure returns (ModifyLiquidityParams memory) {
+        return ModifyLiquidityParams({
+            tickLower: c.lower, tickUpper: c.upper, liquidityDelta: liquidityDelta, salt: salt(c.actor)
+        });
+    }
+
+    /// @notice Removing liquidity returns the position's SURF freely; SURF that became ETH inside it is a
+    /// sell and follows the window and the cap, to the wei.
+    function removeLiquidity(uint256 actorSeed, uint256 rangeSeed, uint256 mode, uint256 fractionSeed) external {
+        LpCall memory c;
+        c.actor = pick(actorSeed);
+        (c.lower, c.upper) = (lowers[rangeSeed % lowers.length], uppers[rangeSeed % lowers.length]);
+        (c.liqBefore, c.surfInBefore) = hook.positions(posKey(c.actor, c.lower, c.upper));
+        if (c.liqBefore == 0) {
+            // Fall back to any position that exists, so that removals happen often enough to matter.
+            if (tracked.length == 0) return;
+            uint256 start = fractionSeed % tracked.length;
+            for (uint256 i = 0; i < tracked.length; i++) {
+                TrackedPosition memory t = tracked[(start + i) % tracked.length];
+                (c.liqBefore, c.surfInBefore) = hook.positions(posKey(t.actor, t.lower, t.upper));
+                if (c.liqBefore != 0) {
+                    (c.actor, c.lower, c.upper) = (t.actor, t.lower, t.upper);
+                    break;
+                }
+            }
+            if (c.liqBefore == 0) return;
+        }
+        c.k = posKey(c.actor, c.lower, c.upper);
+
+        // Remove everything, half, or any part.
+        mode = mode % 3;
+        if (mode == 0) c.amount = c.liqBefore;
+        else if (mode == 1) c.amount = c.liqBefore / 2 == 0 ? c.liqBefore : c.liqBefore / 2;
+        else c.amount = bound(fractionSeed, 1, c.liqBefore);
+
+        _remove(c);
+    }
+
+    function _remove(LpCall memory c) internal {
+        c.day = hook.currentDay();
+        c.open = hook.sellWindowOpen();
+        c.remaining = hook.sellRemaining(c.day);
+        (c.eth0, c.surf1) = poolAmounts(c.lower, c.upper, uint128(c.amount), false);
+        // The v4 test router asserts that a removal pays something out; a dust removal that rounds to
+        // zero on both sides trips that assert in the router, before and independently of the hook.
+        if (c.eth0 == 0 && c.surf1 == 0) return;
+
+        // The hook's rule, restated: the removed share of the recorded deposit, minus what comes back.
+        c.expectedSurf = (c.surfInBefore * c.amount) / c.liqBefore;
+        c.shortfall = c.expectedSurf > c.surf1 + hook.LP_ROUNDING_TOLERANCE() ? c.expectedSurf - c.surf1 : 0;
+
+        if (c.shortfall > 0 && !c.open) {
+            c.expectedErr = hookRevert(
+                IHooks.afterRemoveLiquidity.selector, abi.encodeWithSelector(BuyOnlyVoteHook.SellsClosed.selector)
+            );
+        } else if (c.shortfall > c.remaining) {
+            c.expectedErr = hookRevert(
+                IHooks.afterRemoveLiquidity.selector,
+                abi.encodeWithSelector(BuyOnlyVoteHook.SellCapExceeded.selector, c.shortfall, c.remaining)
+            );
+        }
+
+        c.soldBefore = hook.sold(c.day);
+        c.surfBefore = token.balanceOf(c.actor);
+        c.ethBefore = c.actor.balance;
+        if (c.open) ghostWindowSeenOpen[c.day] = true;
+
+        vm.prank(c.actor);
+        try lpRouter.modifyLiquidity(key, lpParams(c, -int256(c.amount)), "") returns (BalanceDelta delta) {
+            _settledRemoval(c, delta);
+        } catch (bytes memory err) {
+            assertGt(c.expectedErr.length, 0, "liquidity removal refused although it is not a sell");
+            assertEq(err, c.expectedErr, "unexpected liquidity removal error");
+            assertEq(token.balanceOf(c.actor), c.surfBefore, "a refused removal moved SURF");
+            assertEq(c.actor.balance, c.ethBefore, "a refused removal moved ETH");
+            assertEq(hook.sold(c.day), c.soldBefore, "a refused removal was recorded");
+            if (c.open) lpRemovesOverCap++;
+            else lpRemovesClosed++;
+        }
+    }
+
+    function _settledRemoval(LpCall memory c, BalanceDelta delta) internal {
+        assertEq(c.expectedErr.length, 0, "liquidity removal succeeded where the sell rules refuse it");
+        uint256 surfOut = delta.amount1() > 0 ? uint256(int256(delta.amount1())) : 0;
+        uint256 ethOut = delta.amount0() > 0 ? uint256(int256(delta.amount0())) : 0;
+        assertEq(surfOut, c.surf1, "predicted SURF withdrawal");
+        assertEq(token.balanceOf(c.actor), c.surfBefore + surfOut, "LP SURF balance");
+        assertEq(c.actor.balance, c.ethBefore + ethOut, "LP ETH balance");
+
+        (uint256 liqAfter, uint256 surfInAfter) = hook.positions(c.k);
+        assertEq(liqAfter, c.liqBefore - c.amount, "position liquidity mirror");
+        assertEq(surfInAfter, c.surfInBefore - c.expectedSurf, "position SURF record after attribution");
+
+        if (c.shortfall > 0) {
+            assertEq(hook.sold(c.day), c.soldBefore + c.shortfall, "the shortfall must be charged exactly");
+            ghostSold[c.day] += c.shortfall;
+            ghostLpSold[c.day] += c.shortfall;
+            lpRemovesCharged++;
+        } else {
+            assertEq(hook.sold(c.day), c.soldBefore, "a SURF-neutral removal is not a sell");
+            ghostUnchargedShortfall += c.expectedSurf > surfOut ? c.expectedSurf - surfOut : 0;
+            if (!c.open) ghostEthOutOfLpWhileClosed += ethOut;
+            lpRemovesFree++;
+        }
+        ghostSurfReturned[c.k] += surfOut;
+        ghostRemovalsSettled++;
+        if (liqAfter == 0) {
+            // The record is spent; a later add starts a fresh deposit history.
+            assertEq(surfInAfter, 0, "an emptied position keeps a SURF record");
+            ghostSurfDeposited[c.k] = 0;
+            ghostSurfReturned[c.k] = 0;
+        }
+    }
 }
 
 /// forge-config: default.invariant.runs = 48
 /// forge-config: default.invariant.depth = 200
 /// forge-config: default.invariant.fail-on-revert = true
 contract BuyOnlyVoteHookInvariantTest is Test {
+    using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
+
     uint160 constant SQRT_PRICE_1_1 = 79228162514264337593543950336;
-    uint160 constant FLAGS = HookFlags.BEFORE_INITIALIZE | HookFlags.BEFORE_SWAP | HookFlags.AFTER_SWAP;
+    uint160 constant FLAGS = HookFlags.BEFORE_INITIALIZE | HookFlags.AFTER_ADD_LIQUIDITY
+        | HookFlags.AFTER_REMOVE_LIQUIDITY | HookFlags.BEFORE_SWAP | HookFlags.AFTER_SWAP;
     uint256 constant START = 1_700_000_000;
 
     PoolManager manager;
@@ -372,7 +641,7 @@ contract BuyOnlyVoteHookInvariantTest is Test {
         key = PoolKey({
             currency0: Currency.wrap(address(0)),
             currency1: Currency.wrap(address(token)),
-            fee: 3_000,
+            fee: 0,
             tickSpacing: 60,
             hooks: IHooks(address(hook))
         });
@@ -386,12 +655,12 @@ contract BuyOnlyVoteHookInvariantTest is Test {
             ""
         );
 
-        handler = new BuyOnlyVoteHookHandler(manager, token, hook, swapRouter, key);
+        handler = new BuyOnlyVoteHookHandler(manager, token, hook, swapRouter, lpRouter, key);
         token.transfer(address(handler), 3 * handler.ACTOR_FUNDING());
         handler.fundActors();
 
         targetContract(address(handler));
-        bytes4[] memory selectors = new bytes4[](7);
+        bytes4[] memory selectors = new bytes4[](9);
         selectors[0] = BuyOnlyVoteHookHandler.warp.selector;
         selectors[1] = BuyOnlyVoteHookHandler.stake.selector;
         selectors[2] = BuyOnlyVoteHookHandler.unstake.selector;
@@ -399,6 +668,8 @@ contract BuyOnlyVoteHookInvariantTest is Test {
         selectors[4] = BuyOnlyVoteHookHandler.buy.selector;
         selectors[5] = BuyOnlyVoteHookHandler.sell.selector;
         selectors[6] = BuyOnlyVoteHookHandler.rallyYes.selector;
+        selectors[7] = BuyOnlyVoteHookHandler.addLiquidity.selector;
+        selectors[8] = BuyOnlyVoteHookHandler.removeLiquidity.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
 
@@ -417,9 +688,11 @@ contract BuyOnlyVoteHookInvariantTest is Test {
         assertEq(token.balanceOf(address(hook)), sum, "hook balance vs sum of stakes");
     }
 
-    /// @notice The hook never ends up holding ETH: it charges no fee and takes no delta.
-    function invariant_hookNeverHoldsEth() public view {
+    /// @notice The hook never ends up holding ETH or pool claims: it charges no fee and takes no delta.
+    function invariant_hookNeverHoldsEthOrClaims() public view {
         assertEq(address(hook).balance, 0);
+        assertEq(manager.balanceOf(address(hook), 0), 0, "ETH claims");
+        assertEq(manager.balanceOf(address(hook), uint256(uint160(address(token)))), 0, "SURF claims");
     }
 
     /// @notice SURF is a fixed supply and every unit is somewhere we can name.
@@ -436,7 +709,7 @@ contract BuyOnlyVoteHookInvariantTest is Test {
 
     // ---- the trading rules ------------------------------------------------------------------------
 
-    /// @notice On every day ever touched, sells never exceeded half of the previous day's buys.
+    /// @notice On every day ever touched, net sells never exceeded half of the previous day's net buys.
     function invariant_soldNeverExceedsTheCap() public view {
         uint256 last = hook.currentDay();
         for (uint256 d = 0; d <= last; d++) {
@@ -447,23 +720,32 @@ contract BuyOnlyVoteHookInvariantTest is Test {
         }
     }
 
-    /// @notice Anything sold on a day was sold on a day whose vote passed, and the window was seen open.
+    /// @notice Anything sold on a day (by swap or by withdrawing converted liquidity) was sold on a day
+    /// whose vote passed, and the window was seen open.
     function invariant_sellsHappenOnlyOnVotedDays() public view {
         uint256 last = hook.currentDay();
         for (uint256 d = 0; d <= last; d++) {
-            if (hook.sold(d) > 0) {
+            if (hook.sold(d) > 0 || handler.ghostSwapSold(d) > 0 || handler.ghostLpSold(d) > 0) {
                 assertTrue(hook.votePassed(d), "sold on a day whose vote did not pass");
                 assertTrue(handler.ghostWindowSeenOpen(d), "sold on a day whose window was never open");
             }
         }
     }
 
-    /// @notice Internal accounting equals the deltas the swappers actually received or paid.
+    /// @notice Internal accounting equals the deltas the swappers and LPs actually received or paid:
+    /// `sold` is swap sells plus liquidity charges minus what buys cancelled; `bought` is the net buy.
     function invariant_accountingMatchesSwapDeltas() public view {
         uint256 last = hook.currentDay();
         for (uint256 d = 0; d <= last; d++) {
             assertEq(hook.bought(d), handler.ghostBought(d), "bought vs deltas");
             assertEq(hook.sold(d), handler.ghostSold(d), "sold vs deltas");
+            assertEq(
+                hook.sold(d) + handler.ghostCancelled(d),
+                handler.ghostSwapSold(d) + handler.ghostLpSold(d),
+                "sold decomposition"
+            );
+            assertEq(hook.bought(d) + handler.ghostCancelled(d), handler.ghostGrossBought(d), "bought decomposition");
+            assertLe(handler.ghostCancelled(d), handler.ghostSwapSold(d) + handler.ghostLpSold(d), "over-cancelled");
         }
     }
 
@@ -525,10 +807,44 @@ contract BuyOnlyVoteHookInvariantTest is Test {
         assertEq(address(hook.poolManager()), address(manager));
     }
 
-    /// @notice Runs after every sequence: a campaign that never bought or never tried to sell has exercised
-    /// nothing, and the counters make that visible rather than letting the invariants pass vacuously.
+    // ---- liquidity positions ----------------------------------------------------------------------
+
+    /// @notice The hook's mirror of every position's liquidity equals what the pool manager holds for it,
+    /// and the SURF it remembers never exceeds what the position actually took in.
+    function invariant_positionRecordsMirrorThePool() public view {
+        PoolId id = key.toId();
+        for (uint256 i = 0; i < handler.trackedCount(); i++) {
+            (address actor, int24 lower, int24 upper) = handler.tracked(i);
+            bytes32 k = handler.posKey(actor, lower, upper);
+            (uint256 liq, uint256 surfIn) = hook.positions(k);
+            assertEq(liq, IPoolManager(address(manager)).getPositionLiquidity(id, k), "liquidity mirror");
+            assertLe(surfIn, handler.ghostSurfDeposited(k), "recorded SURF exceeds what was deposited");
+            if (liq == 0) assertEq(surfIn, 0, "empty position still records SURF");
+        }
+    }
+
+    /// @notice The only SURF that can turn into ETH without being charged is the rounding tolerance, and at
+    /// most once per settled removal.
+    function invariant_toleranceLeakIsBounded() public view {
+        assertLe(
+            handler.ghostUnchargedShortfall(),
+            handler.ghostRemovalsSettled() * hook.LP_ROUNDING_TOLERANCE(),
+            "uncharged shortfall beyond the per-removal tolerance"
+        );
+    }
+
+    /// @notice Runs after every sequence: a campaign that never bought, never tried to sell or never touched
+    /// liquidity has exercised nothing, and the counters make that visible rather than letting the invariants
+    /// pass vacuously.
     function afterInvariant() public view {
         assertGt(handler.buys(), 0, "no buy happened in this sequence");
         assertGt(handler.sellsDone() + handler.sellsClosed() + handler.sellsOverCap(), 0, "no sell was attempted");
+        assertGt(handler.lpAdds(), 0, "no liquidity was added in this sequence");
+        assertGt(
+            handler.lpRemovesFree() + handler.lpRemovesCharged() + handler.lpRemovesClosed()
+                + handler.lpRemovesOverCap(),
+            0,
+            "no liquidity removal was attempted"
+        );
     }
 }
